@@ -6228,6 +6228,121 @@ def test_set_cors():
     status = _get_status(e.response)
     eq(status, 404)
 
+def _cors_request_and_check(func, url, headers, expect_status, expect_allow_origin, expect_allow_methods):
+    r = func(url, headers=headers)
+    eq(r.status_code, expect_status)
+
+    assert r.headers.get('access-control-allow-origin', None) == expect_allow_origin
+    assert r.headers.get('access-control-allow-methods', None) == expect_allow_methods
+    
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='check cors response when origin header set')
+@attr(assertion='returning cors header')
+def test_cors_origin_response():
+    bucket_name = _setup_bucket_acl(bucket_acl='public-read')
+    client = get_client()
+
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'], 
+             'AllowedOrigins': ['*suffix'],
+            },
+            {'AllowedMethods': ['GET'], 
+             'AllowedOrigins': ['start*end'],
+            },
+            {'AllowedMethods': ['GET'], 
+             'AllowedOrigins': ['prefix*'],
+            },
+            {'AllowedMethods': ['PUT'], 
+             'AllowedOrigins': ['*.put'],
+            }
+        ]
+    }
+
+    e = assert_raises(ClientError, client.get_bucket_cors, Bucket=bucket_name)
+    status = _get_status(e.response)
+    eq(status, 404)
+
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    url = _get_post_url(bucket_name)
+
+    _cors_request_and_check(requests.get, url, None, 200, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': 'foo.suffix'}, 200, 'foo.suffix', 'GET')
+    _cors_request_and_check(requests.get, url, {'Origin': 'foo.bar'}, 200, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': 'foo.suffix.get'}, 200, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': 'startend'}, 200, 'startend', 'GET')
+    _cors_request_and_check(requests.get, url, {'Origin': 'start1end'}, 200, 'start1end', 'GET')
+    _cors_request_and_check(requests.get, url, {'Origin': 'start12end'}, 200, 'start12end', 'GET')
+    _cors_request_and_check(requests.get, url, {'Origin': '0start12end'}, 200, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': 'prefix'}, 200, 'prefix', 'GET')
+    _cors_request_and_check(requests.get, url, {'Origin': 'prefix.suffix'}, 200, 'prefix.suffix', 'GET')
+    _cors_request_and_check(requests.get, url, {'Origin': 'bla.prefix'}, 200, None, None)
+
+    obj_url = '{u}/{o}'.format(u=url, o='bar')
+    _cors_request_and_check(requests.get, obj_url, {'Origin': 'foo.suffix'}, 404, 'foo.suffix', 'GET')
+    _cors_request_and_check(requests.put, obj_url, {'Origin': 'foo.suffix', 'Access-Control-Request-Method': 'GET',
+                                                    'content-length': '0'}, 403, 'foo.suffix', 'GET')
+    _cors_request_and_check(requests.put, obj_url, {'Origin': 'foo.suffix', 'Access-Control-Request-Method': 'PUT',
+                                                    'content-length': '0'}, 403, None, None)
+
+    _cors_request_and_check(requests.put, obj_url, {'Origin': 'foo.suffix', 'Access-Control-Request-Method': 'DELETE',
+                                                    'content-length': '0'}, 403, None, None)
+    _cors_request_and_check(requests.put, obj_url, {'Origin': 'foo.suffix', 'content-length': '0'}, 403, None, None)
+
+    _cors_request_and_check(requests.put, obj_url, {'Origin': 'foo.put', 'content-length': '0'}, 403, 'foo.put', 'PUT')
+
+    _cors_request_and_check(requests.get, obj_url, {'Origin': 'foo.suffix'}, 404, 'foo.suffix', 'GET')
+
+    _cors_request_and_check(requests.options, url, None, 400, None, None)
+    _cors_request_and_check(requests.options, url, {'Origin': 'foo.suffix'}, 400, None, None)
+    _cors_request_and_check(requests.options, url, {'Origin': 'bla'}, 400, None, None)
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'foo.suffix', 'Access-Control-Request-Method': 'GET',
+                                                    'content-length': '0'}, 200, 'foo.suffix', 'GET')
+    _cors_request_and_check(requests.options, url, {'Origin': 'foo.bar', 'Access-Control-Request-Method': 'GET'}, 403, None, None)
+    _cors_request_and_check(requests.options, url, {'Origin': 'foo.suffix.get', 'Access-Control-Request-Method': 'GET'}, 403, None, None)
+    _cors_request_and_check(requests.options, url, {'Origin': 'startend', 'Access-Control-Request-Method': 'GET'}, 200, 'startend', 'GET')
+    _cors_request_and_check(requests.options, url, {'Origin': 'start1end', 'Access-Control-Request-Method': 'GET'}, 200, 'start1end', 'GET')
+    _cors_request_and_check(requests.options, url, {'Origin': 'start12end', 'Access-Control-Request-Method': 'GET'}, 200, 'start12end', 'GET')
+    _cors_request_and_check(requests.options, url, {'Origin': '0start12end', 'Access-Control-Request-Method': 'GET'}, 403, None, None)
+    _cors_request_and_check(requests.options, url, {'Origin': 'prefix', 'Access-Control-Request-Method': 'GET'}, 200, 'prefix', 'GET')
+    _cors_request_and_check(requests.options, url, {'Origin': 'prefix.suffix', 'Access-Control-Request-Method': 'GET'}, 200, 'prefix.suffix', 'GET')
+    _cors_request_and_check(requests.options, url, {'Origin': 'bla.prefix', 'Access-Control-Request-Method': 'GET'}, 403, None, None)
+    _cors_request_and_check(requests.options, url, {'Origin': 'foo.put', 'Access-Control-Request-Method': 'GET'}, 403, None, None)
+    _cors_request_and_check(requests.options, url, {'Origin': 'foo.put', 'Access-Control-Request-Method': 'PUT'}, 200, 'foo.put', 'PUT')
+
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='check cors response when origin is set to wildcard')
+@attr(assertion='returning cors header')
+def test_cors_origin_wildcard():
+    bucket_name = _setup_bucket_acl(bucket_acl='public-read')
+    client = get_client()
+
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'], 
+             'AllowedOrigins': ['*'],
+            },
+        ]
+    }
+
+    e = assert_raises(ClientError, client.get_bucket_cors, Bucket=bucket_name)
+    status = _get_status(e.response)
+    eq(status, 404)
+
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    url = _get_post_url(bucket_name)
+
+    _cors_request_and_check(requests.get, url, None, 200, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': 'example.origin'}, 200, '*', 'GET')
+
 class FakeFile(object):
     """
     file that simulates seek, tell, and current character
@@ -6267,3 +6382,194 @@ class FakeWriteFile(FakeFile):
             self.interrupt()
 
         return self.char*count
+
+class FakeReadFile(FakeFile):
+    """
+    file that simulates writes, interrupting after the second
+    """
+    def __init__(self, size, char='A', interrupt=None):
+        FakeFile.__init__(self, char, interrupt)
+        self.interrupted = False
+        self.size = 0
+        self.expected_size = size
+
+    def write(self, chars):
+        eq(chars, self.char*len(chars))
+        self.offset += len(chars)
+        self.size += len(chars)
+
+        # Sneaky! do stuff on the second seek
+        if not self.interrupted and self.interrupt != None \
+                and self.offset > 0:
+            self.interrupt()
+            self.interrupted = True
+
+    def close(self):
+        eq(self.size, self.expected_size)
+
+class FakeFileVerifier(object):
+    """
+    file that verifies expected data has been written
+    """
+    def __init__(self, char=None):
+        self.char = char
+        self.size = 0
+
+    def write(self, data):
+        size = len(data)
+        if self.char == None:
+            self.char = data[0]
+        self.size += size
+        eq(data, self.char*size)
+
+def _verify_atomic_key_data(bucket_name, key, size=-1, char=None):
+    """
+    Make sure file is of the expected size and (simulated) content
+    """
+    fp_verify = FakeFileVerifier(char)
+    client = get_client()
+    client.download_fileobj(bucket_name, key, fp_verify)
+    if size >= 0:
+        eq(fp_verify.size, size)
+
+def _test_atomic_read(file_size):
+    """
+    Create a file of A's, use it to set_contents_from_file.
+    Create a file of B's, use it to re-set_contents_from_file.
+    Re-read the contents, and confirm we get B's
+    """
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+
+    fp_a = FakeWriteFile(file_size, 'A')
+    client.put_object(Bucket=bucket_name, Key='testobj', Body=fp_a)
+
+    fp_b = FakeWriteFile(file_size, 'B')
+    fp_a2 = FakeReadFile(file_size, 'A',
+        lambda: client.put_object(Bucket=bucket_name, Key='testobj', Body=fp_b)
+        )
+
+    read_client = get_client()
+
+    read_client.download_fileobj(bucket_name, 'testobj', fp_a2)
+    fp_a2.close()
+
+    _verify_atomic_key_data(bucket_name, 'testobj', file_size, 'B')
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='read atomicity')
+@attr(assertion='1MB successful')
+def test_atomic_read_1mb():
+    _test_atomic_read(1024*1024)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='read atomicity')
+@attr(assertion='4MB successful')
+def test_atomic_read_4mb():
+    _test_atomic_read(1024*1024*4)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='read atomicity')
+@attr(assertion='8MB successful')
+def test_atomic_read_8mb():
+    _test_atomic_read(1024*1024*8)
+
+def _test_atomic_write(file_size):
+    """
+    Create a file of A's, use it to set_contents_from_file.
+    Verify the contents are all A's.
+    Create a file of B's, use it to re-set_contents_from_file.
+    Before re-set continues, verify content's still A's
+    Re-read the contents, and confirm we get B's
+    """
+    bucket_name = get_new_bucket()
+    client = get_client()
+    objname = 'testobj'
+
+
+    # create <file_size> file of A's
+    fp_a = FakeWriteFile(file_size, 'A')
+    client.put_object(Bucket=bucket_name, Key=objname, Body=fp_a)
+
+    # verify A's
+    _verify_atomic_key_data(bucket_name, objname, file_size, 'A')
+
+    # create <file_size> file of B's
+    # but try to verify the file before we finish writing all the B's
+    fp_b = FakeWriteFile(file_size, 'B',
+        lambda: _verify_atomic_key_data(bucket_name, objname, file_size)
+        )
+
+    client.put_object(Bucket=bucket_name, Key=objname, Body=fp_b)
+
+    # verify B's
+    _verify_atomic_key_data(bucket_name, objname, file_size, 'B')
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write atomicity')
+@attr(assertion='1MB successful')
+def test_atomic_write_1mb():
+    _test_atomic_write(1024*1024)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write atomicity')
+@attr(assertion='4MB successful')
+def test_atomic_write_4mb():
+    _test_atomic_write(1024*1024*4)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write atomicity')
+@attr(assertion='8MB successful')
+def test_atomic_write_8mb():
+    _test_atomic_write(1024*1024*8)
+
+def _test_atomic_dual_write(file_size):
+    """
+    create an object, two sessions writing different contents
+    confirm that it is all one or the other
+    """
+    bucket_name = get_new_bucket()
+    objname = 'testobj'
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key=objname)
+
+    # write <file_size> file of B's
+    # but before we're done, try to write all A's
+    fp_a = FakeWriteFile(file_size, 'A')
+    fp_b = FakeWriteFile(file_size, 'B',
+        lambda: client.put_object(Bucket=bucket_name, Key=objname, Body=fp_a)
+        )
+    client.put_object(Bucket=bucket_name, Key=objname, Body=fp_b)
+
+    # verify the file
+    _verify_atomic_key_data(bucket_name, objname, file_size)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write one or the other')
+@attr(assertion='1MB successful')
+def test_atomic_dual_write_1mb():
+    # TODO: TAKE A LOOK AT THIS
+    _test_atomic_dual_write(1024*1024)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write one or the other')
+@attr(assertion='4MB successful')
+def test_atomic_dual_write_4mb():
+    _test_atomic_dual_write(1024*1024*4)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write one or the other')
+@attr(assertion='8MB successful')
+def test_atomic_dual_write_8mb():
+    _test_atomic_dual_write(1024*1024*8)
+

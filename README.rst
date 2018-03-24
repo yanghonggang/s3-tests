@@ -90,7 +90,7 @@ Many of the tests have been ported over to Boto3. These tests are located in
 the s3test_boto3 directory. The sample config file, config_boto3.yaml can be
 used to run the Boto3 tests on a Ceph cluster started with vstart::
 
-        S3TEST_CONF=config_boto3.yaml ./virtualenv/bin/nosetests -v -s -A 'not fails_on_rgw' s3tests_boto3.functional.test_s3
+        S3TEST_CONF=s3tests.conf ./virtualenv/bin/nosetests -v -s -A 'not fails_on_rgw' s3tests_boto3.functional.test_s3
 
 
 TODO
