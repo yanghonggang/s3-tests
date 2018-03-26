@@ -6573,3 +6573,186 @@ def test_atomic_dual_write_4mb():
 def test_atomic_dual_write_8mb():
     _test_atomic_dual_write(1024*1024*8)
 
+def _test_atomic_conditional_write(file_size):
+    """
+    Create a file of A's, use it to set_contents_from_file.
+    Verify the contents are all A's.
+    Create a file of B's, use it to re-set_contents_from_file.
+    Before re-set continues, verify content's still A's
+    Re-read the contents, and confirm we get B's
+    """
+    bucket_name = get_new_bucket()
+    objname = 'testobj'
+    client = get_client()
+
+    # create <file_size> file of A's
+    fp_a = FakeWriteFile(file_size, 'A')
+    client.put_object(Bucket=bucket_name, Key=objname, Body=fp_a)
+
+    fp_b = FakeWriteFile(file_size, 'B',
+        lambda: _verify_atomic_key_data(bucket_name, objname, file_size)
+        )
+
+    # create <file_size> file of B's
+    # but try to verify the file before we finish writing all the B's
+    lf = (lambda **kwargs: kwargs['params']['headers'].update({'If-Match': '*'}))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key=objname, Body=fp_b)
+
+    # verify B's
+    _verify_atomic_key_data(bucket_name, objname, file_size, 'B')
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write atomicity')
+@attr(assertion='1MB successful')
+@attr('fails_on_aws')
+def test_atomic_conditional_write_1mb():
+    _test_atomic_conditional_write(1024*1024)
+
+def _test_atomic_dual_conditional_write(file_size):
+    """
+    create an object, two sessions writing different contents
+    confirm that it is all one or the other
+    """
+    bucket_name = get_new_bucket()
+    objname = 'testobj'
+    client = get_client()
+
+    fp_a = FakeWriteFile(file_size, 'A')
+    response = client.put_object(Bucket=bucket_name, Key=objname, Body=fp_a)
+    _verify_atomic_key_data(bucket_name, objname, file_size, 'A')
+    etag_fp_a = response['ETag'].replace('"', '').strip()
+    #etag_fp_a = response['ETag'].replace('"', '')
+
+    # write <file_size> file of C's
+    # but before we're done, try to write all B's
+    fp_b = FakeWriteFile(file_size, 'B')
+    lf = (lambda **kwargs: kwargs['params']['headers'].update({'If-Match': 'etag_fp_a'}))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    fp_c = FakeWriteFile(file_size, 'C',
+        lambda: client.put_object(Bucket=bucket_name, Key=objname, Body=fp_b)
+        )
+
+    # key.set_contents_from_file(fp_c, headers={'If-Match': etag_fp_a})
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=objname, Body=fp_c)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 412)
+    eq(error_code, 'PreconditionFailed')
+
+    # verify the file
+    _verify_atomic_key_data(bucket_name, objname, file_size, 'B')
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write one or the other')
+@attr(assertion='1MB successful')
+@attr('fails_on_aws')
+def test_atomic_dual_conditional_write_1mb():
+    _test_atomic_dual_conditional_write(1024*1024)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write file in deleted bucket')
+@attr(assertion='fail 404')
+@attr('fails_on_aws')
+def test_atomic_write_bucket_gone():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    def remove_bucket():
+        client.delete_bucket(Bucket=bucket_name)
+
+    objname = 'foo'
+    fp_a = FakeWriteFile(1024*1024, 'A', remove_bucket)
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=objname, Body=fp_a)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 404)
+    eq(error_code, 'NoSuckBucket')
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='begin to overwrite file with multipart upload then abort')
+@attr(assertion='read back original key contents')
+def test_atomic_multipart_upload_write():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+
+    response = client.create_multipart_upload(Bucket=bucket_name, Key=key)
+    upload_id = response['UploadId']
+
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    body = _get_body(response)
+    eq(body, 'bar')
+
+    client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id)
+
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    body = _get_body(response)
+    eq(body, 'bar')
+
+class Counter:
+    def __init__(self, default_val):
+        self.val = default_val
+
+    def inc(self):
+        self.val = self.val + 1
+
+class ActionOnCount:
+    def __init__(self, trigger_count, action):
+        self.count = 0
+        self.trigger_count = trigger_count
+        self.action = action
+
+    def trigger(self):
+        self.count = self.count + 1
+
+        if self.count == self.trigger_count:
+            self.action()
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='multipart check for two writes of the same part, first write finishes last')
+@attr(assertion='object contains correct content')
+def test_multipart_resend_first_finishes_last():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key_name = "mymultipart"
+
+    response = client.create_multipart_upload(Bucket=bucket_name, Key=key)
+    upload_id = response['UploadId']
+
+    file_size = 8*1024*1024
+
+    counter = Counter(0)
+    # upload_part might read multiple times from the object
+    # first time when it calculates md5, second time when it writes data
+    # out. We want to interject only on the last time, but we can't be
+    # sure how many times it's going to read, so let's have a test run
+    # and count the number of reads
+
+    fp_dryrun = FakeWriteFile(file_size, 'C',
+        lambda: counter.inc()
+        )
+
+    parts = []
+
+    response = client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key_name, PartNumber=1, Body=fp_dry_run)
+
+    parts.append({'ETag': response['ETag'].strip('"'), 'PartNumber': 1})
+    client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+
+    client.delete_object(Bucket=bucket_name, Key=key_name)
+    
+    # ok, now for the actual test
+    fp_b = FakeWriteFile(file_size, 'B')
+
+    #TODO: The rest of this test
+
+
+
+
+
+
