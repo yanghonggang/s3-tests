@@ -165,6 +165,7 @@ def setup():
     try:
         config.main_api_name = cfg.get('s3 main',"api_name")
     except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+        config.main_api_name = ""
         pass
 
     config.alt_access_key = cfg.get('s3 alt',"access_key")
