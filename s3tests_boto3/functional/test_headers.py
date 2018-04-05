@@ -49,10 +49,30 @@ def tag(*tags):
 @attr(method='put')
 @attr(operation='create w/invalid MD5')
 @attr(assertion='fails 400')
-#TODO: have a similar function if necessary
-#@nose.with_setup(teardown=_clear_custom_headers)
 def test_object_create_bad_md5_invalid_short():
     e = _setup_bad_object({'Content-MD5':'YWJyYWNhZGFicmE='})
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'InvalidDigest')
+
+@tag('auth_common')
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='create w/mismatched MD5')
+@attr(assertion='fails 400')
+def test_object_create_bad_md5_bad():
+    e = _setup_bad_object({'Content-MD5':'rL0Y20xC+Fzt72VPzMSk2A=='})
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'BadDigest')
+
+@tag('auth_common')
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='create w/empty MD5')
+@attr(assertion='fails 400')
+def test_object_create_bad_md5_empty():
+    e = _setup_bad_object({'Content-MD5':''})
     status, error_code = _get_status_and_error_code(e.response)
     eq(status, 400)
     eq(error_code, 'InvalidDigest')

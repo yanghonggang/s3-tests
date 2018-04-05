@@ -162,7 +162,10 @@ def setup():
     config.main_display_name = cfg.get('s3 main',"display_name")
     config.main_user_id = cfg.get('s3 main',"user_id")
     config.main_email = cfg.get('s3 main',"email")
-    config.main_api_name = cfg.get('s3 main',"api_name")
+    try:
+        config.main_api_name = cfg.get('s3 main',"api_name")
+    except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+        pass
 
     config.alt_access_key = cfg.get('s3 alt',"access_key")
     config.alt_secret_key = cfg.get('s3 alt',"secret_key")
