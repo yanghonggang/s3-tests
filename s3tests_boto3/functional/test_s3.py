@@ -848,6 +848,7 @@ def check_configure_versioning_retry(bucket_name, status, expected_string):
 @attr(method='head')
 @attr(operation='compare w/bucket list when bucket versioning is configured')
 @attr(assertion='return same metadata')
+@attr('versioning')
 def test_bucket_list_return_data_versioning():
     bucket_name = get_new_bucket()
     check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
@@ -6543,9 +6544,13 @@ def _test_atomic_dual_write(file_size):
     # write <file_size> file of B's
     # but before we're done, try to write all A's
     fp_a = FakeWriteFile(file_size, 'A')
-    fp_b = FakeWriteFile(file_size, 'B',
-        lambda: client.put_object(Bucket=bucket_name, Key=objname, Body=fp_a)
-        )
+
+    def rewind_put_fp_a():
+        #TODO: learn why this is necessary
+        fp_a.seek(0)
+        client.put_object(Bucket=bucket_name, Key=objname, Body=fp_a)
+
+    fp_b = FakeWriteFile(file_size, 'B', rewind_put_fp_a)
     client.put_object(Bucket=bucket_name, Key=objname, Body=fp_b)
 
     # verify the file
@@ -6556,7 +6561,6 @@ def _test_atomic_dual_write(file_size):
 @attr(operation='write one or the other')
 @attr(assertion='1MB successful')
 def test_atomic_dual_write_1mb():
-    # TODO: TAKE A LOOK AT THIS
     _test_atomic_dual_write(1024*1024)
 
 @attr(resource='object')
@@ -6622,27 +6626,27 @@ def _test_atomic_dual_conditional_write(file_size):
     fp_a = FakeWriteFile(file_size, 'A')
     response = client.put_object(Bucket=bucket_name, Key=objname, Body=fp_a)
     _verify_atomic_key_data(bucket_name, objname, file_size, 'A')
-    etag_fp_a = response['ETag'].replace('"', '').strip()
-    #etag_fp_a = response['ETag'].replace('"', '')
+    etag_fp_a = response['ETag'].replace('"', '')
 
     # write <file_size> file of C's
     # but before we're done, try to write all B's
     fp_b = FakeWriteFile(file_size, 'B')
-    lf = (lambda **kwargs: kwargs['params']['headers'].update({'If-Match': 'etag_fp_a'}))
+    lf = (lambda **kwargs: kwargs['params']['headers'].update({'If-Match': etag_fp_a}))
     client.meta.events.register('before-call.s3.PutObject', lf)
-    fp_c = FakeWriteFile(file_size, 'C',
-        lambda: client.put_object(Bucket=bucket_name, Key=objname, Body=fp_b)
-        )
+    def rewind_put_fp_b():
+        #TODO: learn why this is necessary
+        fp_b.seek(0)
+        client.put_object(Bucket=bucket_name, Key=objname, Body=fp_b)
 
-    # key.set_contents_from_file(fp_c, headers={'If-Match': etag_fp_a})
+    fp_c = FakeWriteFile(file_size, 'C', rewind_put_fp_b)
+
     e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=objname, Body=fp_c)
     status, error_code = _get_status_and_error_code(e.response)
     eq(status, 412)
     eq(error_code, 'PreconditionFailed')
 
     # verify the file
-    #TODO: looks whats happening here when the below function is uncommented
-    #_verify_atomic_key_data(bucket_name, objname, file_size, 'B')
+    _verify_atomic_key_data(bucket_name, objname, file_size, 'B')
 
 @attr(resource='object')
 @attr(method='put')
@@ -6650,7 +6654,6 @@ def _test_atomic_dual_conditional_write(file_size):
 @attr(assertion='1MB successful')
 @attr('fails_on_aws')
 def test_atomic_dual_conditional_write_1mb():
-    #TODO: Look at this one
     _test_atomic_dual_conditional_write(1024*1024)
 
 @attr(resource='object')
@@ -6727,7 +6730,8 @@ def test_multipart_resend_first_finishes_last():
     response = client.create_multipart_upload(Bucket=bucket_name, Key=key_name)
     upload_id = response['UploadId']
 
-    file_size = 8*1024*1024
+    #file_size = 8*1024*1024
+    file_size = 8
 
     counter = Counter(0)
     # upload_part might read multiple times from the object
@@ -6748,26 +6752,31 @@ def test_multipart_resend_first_finishes_last():
     client.complete_multipart_upload(Bucket=bucket_name, Key=key_name, UploadId=upload_id, MultipartUpload={'Parts': parts})
 
     client.delete_object(Bucket=bucket_name, Key=key_name)
+
+    # clear parts
+    parts[:] = []
     
     # ok, now for the actual test
     fp_b = FakeWriteFile(file_size, 'B')
+    def upload_fp_b():
+        response = client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key_name, Body=fp_b, PartNumber=1)
+        parts.append({'ETag': response['ETag'].strip('"'), 'PartNumber': 1})
 
-    action = ActionOnCount(counter.val, lambda: client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key_name, Body=fp_b, PartNumber=1))
+    action = ActionOnCount(counter.val, lambda: upload_fp_b())
+
+    response = client.create_multipart_upload(Bucket=bucket_name, Key=key_name)
+    upload_id = response['UploadId']
 
     fp_a = FakeWriteFile(file_size, 'A',
         lambda: action.trigger()
         )
-
-    response = client.create_multipart_upload(Bucket=bucket_name, Key=key_name)
-    upload_id = response['UploadId']
 
     response = client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key_name, PartNumber=1, Body=fp_a)
 
     parts.append({'ETag': response['ETag'].strip('"'), 'PartNumber': 1})
     client.complete_multipart_upload(Bucket=bucket_name, Key=key_name, UploadId=upload_id, MultipartUpload={'Parts': parts})
 
-    #TODO: looks whats happening here when the below function is uncommented
-    #_verify_atomic_key_data(bucket_name, key_name, file_size, 'B')
+    _verify_atomic_key_data(bucket_name, key_name, file_size, 'A')
 
 @attr(resource='object')
 @attr(method='get')
@@ -6892,4 +6901,5 @@ def test_versioning_bucket_create_suspend():
     check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
     check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
     check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+
 
