@@ -50,10 +50,9 @@ def get_buckets_list(client=None, prefix=None):
     response = client.list_buckets()
     bucket_dicts = response['Buckets']
     buckets_list = []
-    if bucket_dicts != []:
-        for bucket in bucket_dicts:
-            if prefix in bucket['Name']:
-                buckets_list.append(bucket['Name'])
+    for bucket in bucket_dicts:
+        if prefix in bucket['Name']:
+            buckets_list.append(bucket['Name'])
 
     return buckets_list
 

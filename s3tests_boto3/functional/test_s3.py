@@ -1432,6 +1432,46 @@ def test_post_object_authenticated_request():
 
 @attr(resource='object')
 @attr(method='post')
+@attr(operation='authenticated browser based upload via POST request, no content-type header')
+@attr(assertion='succeeds and returns written data')
+def test_post_object_authenticated_no_content_type():
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(ACL='public-read-write', Bucket=bucket_name)
+
+
+    url = _get_post_url(bucket_name)
+    utc = pytz.utc
+    expires = datetime.datetime.now(utc) + datetime.timedelta(seconds=+6000)
+
+    policy_document = {"expiration": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),\
+    "conditions": [\
+    {"bucket": bucket_name},\
+    ["starts-with", "$key", "foo"],\
+    {"acl": "private"},\
+    ["content-length-range", 0, 1024]\
+    ]\
+    }
+
+    json_policy_document = json.JSONEncoder().encode(policy_document)
+    policy = base64.b64encode(json_policy_document)
+    aws_secret_access_key = get_main_aws_secret_key()
+    aws_access_key_id = get_main_aws_access_key()
+
+    signature = base64.b64encode(hmac.new(aws_secret_access_key, policy, sha).digest())
+
+    payload = OrderedDict([ ("key" , "foo.txt"),("AWSAccessKeyId" , aws_access_key_id),\
+    ("acl" , "private"),("signature" , signature),("policy" , policy),\
+    ('file', ('bar'))])
+
+    r = requests.post(url, files = payload)
+    eq(r.status_code, 204)
+    response = client.get_object(Bucket=bucket_name, Key="foo.txt")
+    body = _get_body(response)
+    eq(body, 'bar')
+
+@attr(resource='object')
+@attr(method='post')
 @attr(operation='authenticated browser based upload via POST request, bad access key')
 @attr(assertion='fails')
 def test_post_object_authenticated_request_bad_access_key():
@@ -5673,7 +5713,9 @@ def test_multipart_copy_invalid_range():
 
     e = assert_raises(ClientError, client.upload_part_copy,Bucket=src_bucket_name, Key='dest', UploadId=upload_id, CopySource=copy_source, CopySourceRange=copy_source_range, PartNumber=1)
     status, error_code = _get_status_and_error_code(e.response)
-    eq(status, 416)
+    valid_status = [400, 416]
+    if not e.status in valid_status:
+       raise AssertionError("Invalid response " + str(status))
     eq(error_code, 'InvalidRange')
 
 @attr(resource='object')
@@ -6344,6 +6386,36 @@ def test_cors_origin_wildcard():
     _cors_request_and_check(requests.get, url, None, 200, None, None)
     _cors_request_and_check(requests.get, url, {'Origin': 'example.origin'}, 200, '*', 'GET')
 
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='check cors response when Access-Control-Request-Headers is set in option request')
+@attr(assertion='returning cors header')
+def test_cors_header_option():
+    bucket_name = _setup_bucket_acl(bucket_acl='public-read')
+    client = get_client()
+
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'], 
+             'AllowedOrigins': ['*'],
+             'ExposeHeaders': ['x-amz-meta-header1'],
+            },
+        ]
+    }
+
+    e = assert_raises(ClientError, client.get_bucket_cors, Bucket=bucket_name)
+    status = _get_status(e.response)
+    eq(status, 404)
+
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    url = _get_post_url(bucket_name)
+    obj_url = '{u}/{o}'.format(u=url, o='bar')
+
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin','Access-Control-Request-Headers':'x-amz-meta-header2','Access-Control-Request-Method':'GET'}, 403, None, None)
+
 class FakeFile(object):
     """
     file that simulates seek, tell, and current character
@@ -6813,8 +6885,6 @@ def test_ranged_big_request_response_code():
     eq(fetched_content, content[3145728:5242881])
     eq(response['ResponseMetadata']['HTTPHeaders']['content-range'], 'bytes 3145728-5242880/8388608')
     eq(response['ResponseMetadata']['HTTPStatusCode'], 206)
-
-
 
 @attr(resource='object')
 @attr(method='get')
