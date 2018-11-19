@@ -6972,4 +6972,1509 @@ def test_versioning_bucket_create_suspend():
     check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
     check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
 
+def check_obj_content(client, bucket_name, key, version_id, content):
+    response = client.get_object(Bucket=bucket_name, Key=key, VersionId=version_id)
+    if content is not None:
+        body = _get_body(response)
+        eq(body, content)
+    else:
+        eq(response['DeleteMarker'], True)
 
+def check_obj_versions(client, bucket_name, key, version_ids, contents):
+    # check to see if objects is pointing at correct version
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    versions = response['Versions']
+    # obj versions in versions come out created last to first not first to last like version_ids & contents
+    versions.reverse()
+    i = 0
+
+    for version in versions:
+        eq(version['VersionId'], version_ids[i])
+        eq(version['Key'], key)
+        check_obj_content(client, bucket_name, key, version['VersionId'], contents[i])
+        i += 1
+
+def create_multiple_versions(client, bucket_name, key, num_versions, version_ids = None, contents = None):
+    contents = contents or []
+    version_ids = version_ids or []
+
+    for i in xrange(num_versions):
+        body = 'content-{i}'.format(i=i)
+        response = client.put_object(Bucket=bucket_name, Key=key, Body=body)
+        version_id = response['VersionId']
+
+        contents.append(body)
+        version_ids.append(version_id)
+
+    check_obj_versions(client, bucket_name, key, version_ids, contents) 
+
+    return (version_ids, contents)
+
+def remove_obj_version(client, bucket_name, key, version_ids, contents, index):
+    eq(len(version_ids), len(contents))
+    index = index % len(version_ids)
+    rm_version_id = version_ids.pop(index)
+    rm_content = contents.pop(index)
+
+    check_obj_content(client, bucket_name, key, rm_version_id, rm_content)
+
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=rm_version_id)
+
+    if len(version_ids) != 0:
+        check_obj_versions(client, bucket_name, key, version_ids, contents)
+
+# TODO: replace this with the version in __init__.py
+def clean_up_bucket(client, bucket_name, key, version_ids):
+    for version_id in version_ids:
+        client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id)
+
+    client.delete_bucket(Bucket=bucket_name)
+
+def _do_test_create_remove_versions(client, bucket_name, key, num_versions, remove_start_idx, idx_inc):
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+
+    idx = remove_start_idx
+
+    for j in xrange(num_versions-1):
+        remove_obj_version(client, bucket_name, key, version_ids, contents, idx)
+        idx += idx_inc
+
+    clean_up_bucket(client, bucket_name, key, version_ids)
+
+
+@attr(resource='object')
+@attr(method='create')
+@attr(operation='create and remove versioned object')
+@attr(assertion='can create access and remove appropriate versions')
+@attr('versioning')
+def test_versioning_obj_create_read_remove():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_bucket_versioning(Bucket=bucket_name, VersioningConfiguration={'MFADelete': 'Disabled', 'Status': 'Enabled'})
+    key = 'testobj'
+    num_versions = 5
+
+    _do_test_create_remove_versions(client, bucket_name, key, num_versions, -1, 0)
+    _do_test_create_remove_versions(client, bucket_name, key, num_versions, -1, 0)
+    _do_test_create_remove_versions(client, bucket_name, key, num_versions, 0, 0)
+    _do_test_create_remove_versions(client, bucket_name, key, num_versions, 1, 0)
+    _do_test_create_remove_versions(client, bucket_name, key, num_versions, 4, -1)
+    _do_test_create_remove_versions(client, bucket_name, key, num_versions, 3, 3)
+
+@attr(resource='object')
+@attr(method='create')
+@attr(operation='create and remove versioned object and head')
+@attr(assertion='can create access and remove appropriate versions')
+@attr('versioning')
+def test_versioning_obj_create_read_remove_head():
+    bucket_name = get_new_bucket()
+
+    client = get_client()
+    client.put_bucket_versioning(Bucket=bucket_name, VersioningConfiguration={'MFADelete': 'Disabled', 'Status': 'Enabled'})
+    key = 'testobj'
+    num_versions = 5
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+
+    # removes old head object, checks new one
+    removed_version_id = version_ids.pop()
+    contents.pop()
+    num_versions = num_versions-1
+
+    response = client.delete_object(Bucket=bucket_name, Key=key, VersionId=removed_version_id)
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    body = _get_body(response)
+    eq(body, contents[-1])
+
+    # add a delete marker
+    response = client.delete_object(Bucket=bucket_name, Key=key)
+    eq(response['DeleteMarker'], True)
+
+    delete_marker_version_id = response['VersionId']
+    version_ids.append(delete_marker_version_id)
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(len(response['Versions']), num_versions)
+    eq(len(response['DeleteMarkers']), 1)
+    eq(response['DeleteMarkers'][0]['VersionId'], delete_marker_version_id)
+
+    clean_up_bucket(client, bucket_name, key, version_ids)
+
+@attr(resource='object')
+@attr(method='create')
+@attr(operation='create object, then switch to versioning')
+@attr(assertion='behaves correctly')
+@attr('versioning')
+def test_versioning_obj_plain_null_version_removal():
+    bucket_name = get_new_bucket()
+    check_versioning(bucket_name, None)
+
+    client = get_client()
+    key = 'testobjfoo'
+    content = 'fooz'
+    client.put_object(Bucket=bucket_name, Key=key, Body=content)
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId='null')
+
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 404)
+    eq(error_code, 'NoSuchKey')
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(('Versions' in response), False)
+
+@attr(resource='object')
+@attr(method='create')
+@attr(operation='create object, then switch to versioning')
+@attr(assertion='behaves correctly')
+@attr('versioning')
+def test_versioning_obj_plain_null_version_overwrite():
+    bucket_name = get_new_bucket()
+    check_versioning(bucket_name, None)
+
+    client = get_client()
+    key = 'testobjfoo'
+    content = 'fooz'
+    client.put_object(Bucket=bucket_name, Key=key, Body=content)
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    content2 = 'zzz'
+    response = client.put_object(Bucket=bucket_name, Key=key, Body=content2)
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    body = _get_body(response)
+    eq(body, content2)
+
+    version_id = response['VersionId']
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id)
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    body = _get_body(response)
+    eq(body, content)
+
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId='null')
+
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 404)
+    eq(error_code, 'NoSuchKey')
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(('Versions' in response), False)
+
+@attr(resource='object')
+@attr(method='create')
+@attr(operation='create object, then switch to versioning')
+@attr(assertion='behaves correctly')
+@attr('versioning')
+def test_versioning_obj_plain_null_version_overwrite_suspended():
+    bucket_name = get_new_bucket()
+    check_versioning(bucket_name, None)
+
+    client = get_client()
+    key = 'testobjbar'
+    content = 'foooz'
+    client.put_object(Bucket=bucket_name, Key=key, Body=content)
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+
+    content2 = 'zzz'
+    response = client.put_object(Bucket=bucket_name, Key=key, Body=content2)
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    body = _get_body(response)
+    eq(body, content2)
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    # original object with 'null' version id still counts as a version
+    eq(len(response['Versions']), 1)
+
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId='null')
+
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 404)
+    eq(error_code, 'NoSuchKey')
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(('Versions' in response), False)
+
+def delete_suspended_versioning_obj(client, bucket_name, key, version_ids, contents):
+    client.delete_object(Bucket=bucket_name, Key=key)
+
+    # clear out old null objects in lists since they will get overwritten
+    eq(len(version_ids), len(contents))
+    i = 0
+    for version_id in version_ids:
+        if version_id == 'null':
+            version_ids.pop(i)
+            contents.pop(i)
+        i += 1
+
+    return (version_ids, contents)
+
+def overwrite_suspended_versioning_obj(client, bucket_name, key, version_ids, contents, content):
+    client.put_object(Bucket=bucket_name, Key=key, Body=content)
+
+    # clear out old null objects in lists since they will get overwritten
+    eq(len(version_ids), len(contents))
+    i = 0
+    for version_id in version_ids:
+        if version_id == 'null':
+            version_ids.pop(i)
+            contents.pop(i)
+        i += 1
+        
+    # add new content with 'null' version id to the end
+    contents.append(content)
+    version_ids.append('null')
+
+    return (version_ids, contents)
+        
+
+@attr(resource='object')
+@attr(method='create')
+@attr(operation='suspend versioned bucket')
+@attr(assertion='suspended versioning behaves correctly')
+@attr('versioning')
+def test_versioning_obj_suspend_versions():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'testobj'
+    num_versions = 5
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+
+    delete_suspended_versioning_obj(client, bucket_name, key, version_ids, contents)
+    delete_suspended_versioning_obj(client, bucket_name, key, version_ids, contents)
+
+    overwrite_suspended_versioning_obj(client, bucket_name, key, version_ids, contents, 'null content 1')
+    overwrite_suspended_versioning_obj(client, bucket_name, key, version_ids, contents, 'null content 2')
+    delete_suspended_versioning_obj(client, bucket_name, key, version_ids, contents)
+    overwrite_suspended_versioning_obj(client, bucket_name, key, version_ids, contents, 'null content 3')
+    delete_suspended_versioning_obj(client, bucket_name, key, version_ids, contents)
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, 3, version_ids, contents)
+    num_versions += 3
+
+    for idx in xrange(num_versions):
+        remove_obj_version(client, bucket_name, key, version_ids, contents, idx)
+
+    eq(len(version_ids), 0)
+    eq(len(version_ids), len(contents))
+
+@attr(resource='object')
+@attr(method='remove')
+@attr(operation='create and remove versions')
+@attr(assertion='everything works')
+@attr('versioning')
+def test_versioning_obj_create_versions_remove_all():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'testobj'
+    num_versions = 10
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+    for idx in xrange(num_versions):
+        remove_obj_version(client, bucket_name, key, version_ids, contents, idx)
+
+    eq(len(version_ids), 0)
+    eq(len(version_ids), len(contents))
+
+@attr(resource='object')
+@attr(method='remove')
+@attr(operation='create and remove versions')
+@attr(assertion='everything works')
+@attr('versioning')
+def test_versioning_obj_create_versions_remove_special_names():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    keys = ['_testobj', '_', ':', ' ']
+    num_versions = 10
+
+    for key in keys:
+        (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+        for idx in xrange(num_versions):
+            remove_obj_version(client, bucket_name, key, version_ids, contents, idx)
+
+        eq(len(version_ids), 0)
+        eq(len(version_ids), len(contents))
+
+@attr(resource='object')
+@attr(method='multipart')
+@attr(operation='create and test multipart object')
+@attr(assertion='everything works')
+@attr('versioning')
+def test_versioning_obj_create_overwrite_multipart():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'testobj'
+    num_versions = 3
+    contents = []
+    version_ids = []
+
+    for i in xrange(num_versions):
+        ret =  _do_test_multipart_upload_contents(bucket_name, key, 3)
+        contents.append(ret)
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    for version in response['Versions']:
+        version_ids.append(version['VersionId'])
+
+    version_ids.reverse()
+    check_obj_versions(client, bucket_name, key, version_ids, contents) 
+
+    for idx in xrange(num_versions):
+        remove_obj_version(client, bucket_name, key, version_ids, contents, idx)
+
+    eq(len(version_ids), 0)
+    eq(len(version_ids), len(contents))
+
+@attr(resource='object')
+@attr(method='multipart')
+@attr(operation='list versioned objects')
+@attr(assertion='everything works')
+@attr('versioning')
+def test_versioning_obj_list_marker():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'testobj'
+    key2 = 'testobj-1'
+    num_versions = 5
+
+    contents = []
+    version_ids = []
+    contents2 = []
+    version_ids2 = []
+
+    # for key #1
+    for i in xrange(num_versions):
+        body = 'content-{i}'.format(i=i)
+        response = client.put_object(Bucket=bucket_name, Key=key, Body=body)
+        version_id = response['VersionId']
+
+        contents.append(body)
+        version_ids.append(version_id)
+
+    # for key #2
+    for i in xrange(num_versions):
+        body = 'content-{i}'.format(i=i)
+        response = client.put_object(Bucket=bucket_name, Key=key2, Body=body)
+        version_id = response['VersionId']
+
+        contents2.append(body)
+        version_ids2.append(version_id)
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    versions = response['Versions']
+    # obj versions in versions come out created last to first not first to last like version_ids & contents
+    versions.reverse()
+
+    i = 0
+    # test the last 5 created objects first
+    for i in range(5):
+        version = versions[i]
+        eq(version['VersionId'], version_ids2[i])
+        eq(version['Key'], key2)
+        check_obj_content(client, bucket_name, key2, version['VersionId'], contents2[i])
+        i += 1
+
+    # then the first 5
+    for j in range(5):
+        version = versions[i]
+        eq(version['VersionId'], version_ids[j])
+        eq(version['Key'], key)
+        check_obj_content(client, bucket_name, key, version['VersionId'], contents[j])
+        i += 1
+
+@attr(resource='object')
+@attr(method='multipart')
+@attr(operation='create and test versioned object copying')
+@attr(assertion='everything works')
+@attr('versioning')
+def test_versioning_copy_obj_version():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'testobj'
+    num_versions = 3
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+
+    for i in xrange(num_versions):
+        new_key_name = 'key_{i}'.format(i=i)
+        copy_source = {'Bucket': bucket_name, 'Key': key, 'VersionId': version_ids[i]}
+        client.copy_object(Bucket=bucket_name, CopySource=copy_source, Key=new_key_name)
+        response = client.get_object(Bucket=bucket_name, Key=new_key_name)
+        body = _get_body(response)
+        eq(body, contents[i])
+        
+    another_bucket_name = get_new_bucket()
+
+    for i in xrange(num_versions):
+        new_key_name = 'key_{i}'.format(i=i)
+        copy_source = {'Bucket': bucket_name, 'Key': key, 'VersionId': version_ids[i]}
+        client.copy_object(Bucket=another_bucket_name, CopySource=copy_source, Key=new_key_name)
+        response = client.get_object(Bucket=another_bucket_name, Key=new_key_name)
+        body = _get_body(response)
+        eq(body, contents[i])
+        
+    new_key_name = 'new_key'
+    copy_source = {'Bucket': bucket_name, 'Key': key}
+    client.copy_object(Bucket=another_bucket_name, CopySource=copy_source, Key=new_key_name)
+
+    response = client.get_object(Bucket=another_bucket_name, Key=new_key_name)
+    body = _get_body(response)
+    eq(body, contents[-1])
+
+@attr(resource='object')
+@attr(method='delete')
+@attr(operation='delete multiple versions')
+@attr(assertion='deletes multiple versions of an object with a single call')
+@attr('versioning')
+def test_versioning_multi_object_delete():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'key'
+    num_versions = 2
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    versions = response['Versions']
+    versions.reverse()
+
+    for version in versions:
+        client.delete_object(Bucket=bucket_name, Key=key, VersionId=version['VersionId'])
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(('Versions' in response), False)
+
+    # now remove again, should all succeed due to idempotency
+    for version in versions:
+        client.delete_object(Bucket=bucket_name, Key=key, VersionId=version['VersionId'])
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(('Versions' in response), False)
+
+@attr(resource='object')
+@attr(method='delete')
+@attr(operation='delete multiple versions')
+@attr(assertion='deletes multiple versions of an object and delete marker with a single call')
+@attr('versioning')
+def test_versioning_multi_object_delete_with_marker():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'key'
+    num_versions = 2
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+
+    client.delete_object(Bucket=bucket_name, Key=key)
+    response = client.list_object_versions(Bucket=bucket_name)
+    versions = response['Versions']
+    delete_markers = response['DeleteMarkers']
+
+    eq(len(version_ids), 3)
+    eq(len(delete_markers), 1)
+    version_ids.append(delete_markers[0]['VersionId'])
+
+    for version in versions:
+        client.delete_object(Bucket=bucket_name, Key=key, VersionId=version['VersionId'])
+
+    for delete_marker in delete_markers:
+        client.delete_object(Bucket=bucket_name, Key=key, VersionId=delete_marker['VersionId'])
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(('Versions' in response), False)
+    eq(('DeleteMarkers' in response), False)
+
+    for version in versions:
+        client.delete_object(Bucket=bucket_name, Key=key, VersionId=version['VersionId'])
+
+    for delete_marker in delete_markers:
+        client.delete_object(Bucket=bucket_name, Key=key, VersionId=delete_marker['VersionId'])
+
+    # now remove again, should all succeed due to idempotency
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(('Versions' in response), False)
+    eq(('DeleteMarkers' in response), False)
+
+@attr(resource='object')
+@attr(method='delete')
+@attr(operation='multi delete create marker')
+@attr(assertion='returns correct marker version id')
+@attr('versioning')
+def test_versioning_multi_object_delete_with_marker_create():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'key'
+
+    response = client.delete_object(Bucket=bucket_name, Key=key)
+    delete_marker_version_id = response['VersionId']
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    delete_markers = response['DeleteMarkers']
+
+    eq(len(delete_markers), 1)
+    eq(delete_marker_version_id, delete_markers[0]['VersionId'])
+    eq(key, delete_markers[0]['Key'])
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='change acl on an object version changes specific version')
+@attr(assertion='works')
+@attr('versioning')
+def test_versioned_object_acl():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'xyz'
+    num_versions = 3
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+
+    version_id = version_ids[1]
+
+    response = client.get_object_acl(Bucket=bucket_name, Key=key, VersionId=version_id)
+
+    display_name = get_main_display_name()
+    user_id = get_main_user_id()
+    
+    eq(response['Owner']['DisplayName'], display_name)
+    eq(response['Owner']['ID'], user_id)
+
+    grants = response['Grants']
+    default_policy = [
+            dict(
+                Permission='FULL_CONTROL',
+                ID=user_id,
+                DisplayName=display_name,
+                URI=None,
+                EmailAddress=None,
+                Type='CanonicalUser',
+                ),
+            ]
+
+    check_grants(grants, default_policy)
+
+    client.put_object_acl(ACL='public-read',Bucket=bucket_name, Key=key, VersionId=version_id)
+
+    response = client.get_object_acl(Bucket=bucket_name, Key=key, VersionId=version_id)
+    grants = response['Grants']
+    check_grants(
+        grants,
+        [
+            dict(
+                Permission='READ',
+                ID=None,
+                DisplayName=None,
+                URI='http://acs.amazonaws.com/groups/global/AllUsers',
+                EmailAddress=None,
+                Type='Group',
+                ),
+            dict(
+                Permission='FULL_CONTROL',
+                ID=user_id,
+                DisplayName=display_name,
+                URI=None,
+                EmailAddress=None,
+                Type='CanonicalUser',
+                ),
+            ],
+        )
+
+    client.put_object(Bucket=bucket_name, Key=key)
+
+    response = client.get_object_acl(Bucket=bucket_name, Key=key)
+    grants = response['Grants']
+    check_grants(grants, default_policy)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='change acl on an object with no version specified changes latest version')
+@attr(assertion='works')
+@attr('versioning')
+def test_versioned_object_acl_no_version_specified():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'xyz'
+    num_versions = 3
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    version_id = response['VersionId']
+
+    response = client.get_object_acl(Bucket=bucket_name, Key=key, VersionId=version_id)
+
+    display_name = get_main_display_name()
+    user_id = get_main_user_id()
+    
+    eq(response['Owner']['DisplayName'], display_name)
+    eq(response['Owner']['ID'], user_id)
+
+    grants = response['Grants']
+    default_policy = [
+            dict(
+                Permission='FULL_CONTROL',
+                ID=user_id,
+                DisplayName=display_name,
+                URI=None,
+                EmailAddress=None,
+                Type='CanonicalUser',
+                ),
+            ]
+
+    check_grants(grants, default_policy)
+
+    client.put_object_acl(ACL='public-read',Bucket=bucket_name, Key=key)
+
+    response = client.get_object_acl(Bucket=bucket_name, Key=key, VersionId=version_id)
+    grants = response['Grants']
+    check_grants(
+        grants,
+        [
+            dict(
+                Permission='READ',
+                ID=None,
+                DisplayName=None,
+                URI='http://acs.amazonaws.com/groups/global/AllUsers',
+                EmailAddress=None,
+                Type='Group',
+                ),
+            dict(
+                Permission='FULL_CONTROL',
+                ID=user_id,
+                DisplayName=display_name,
+                URI=None,
+                EmailAddress=None,
+                Type='CanonicalUser',
+                ),
+            ],
+        )
+
+def _do_create_object(client, bucket_name, key, i):
+    body = 'data {i}'.format(i=i)
+    client.put_object(Bucket=bucket_name, Key=key, Body=body)
+
+def _do_remove_ver(client, bucket_name, key, version_id):
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id)
+
+def _do_create_versioned_obj_concurrent(client, bucket_name, key, num):
+    t = []
+    for i in range(num):
+        thr = threading.Thread(target = _do_create_object, args=(client, bucket_name, key, i))
+        thr.start()
+        t.append(thr)
+    return t
+
+def _do_clear_versioned_bucket_concurrent(client, bucket_name):
+    t = []
+    response = client.list_object_versions(Bucket=bucket_name)
+    versions = response['Versions']
+    for version in versions:
+        thr = threading.Thread(target = _do_remove_ver, args=(client, bucket_name, version['Key'], version['VersionId']))
+        thr.start()
+        t.append(thr)
+    return t
+
+def _do_wait_completion(t):
+    for thr in t:
+        thr.join()
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='concurrent creation of objects, concurrent removal')
+@attr(assertion='works')
+@attr('versioning')
+def test_versioned_concurrent_object_create_concurrent_remove():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'myobj'
+    num_versions = 5
+
+    for i in xrange(5):
+        t = _do_create_versioned_obj_concurrent(client, bucket_name, key, num_versions)
+        _do_wait_completion(t)
+
+        response = client.list_object_versions(Bucket=bucket_name)
+        versions = response['Versions']
+
+        eq(len(versions), num_versions)
+
+        t = _do_clear_versioned_bucket_concurrent(client, bucket_name)
+        _do_wait_completion(t)
+
+        response = client.list_object_versions(Bucket=bucket_name)
+        eq(('Versions' in response), False)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='concurrent creation and removal of objects')
+@attr(assertion='works')
+@attr('versioning')
+def test_versioned_concurrent_object_create_and_remove():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'myobj'
+    num_versions = 3
+
+    all_threads = []
+
+    for i in xrange(3):
+        t = _do_create_versioned_obj_concurrent(client, bucket_name, key, num_versions)
+
+        # TODO: fix this one, ask Casey about it, I can't have the do_wait_completion here
+        #_do_wait_completion(t)
+        t = _do_clear_versioned_bucket_concurrent(client, bucket_name)
+
+        #t = _do_create_versioned_obj_concurrent(client, bucket_name, key, num_versions)
+        #all_threads.append(t)
+
+        #t = _do_clear_versioned_bucket_concurrent(client, bucket_name)
+        #all_threads.append(t)
+
+    #for t in all_threads:
+        #_do_wait_completion(t)
+
+    #t = _do_clear_versioned_bucket_concurrent(client, bucket_name)
+    #_do_wait_completion(t)
+
+def _test_encryption_sse_customer_write(file_size):
+    """
+    Tests Create a file of A's, use it to set_contents_from_file.
+    Create a file of B's, use it to re-set_contents_from_file.
+    Re-read the contents, and confirm we get B's
+    """
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'testobj'
+    data = 'A'*file_size
+    sse_client_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    body = _get_body(response)
+    eq(body, data)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test SSE-C encrypted transfer 1 byte')
+@attr(assertion='success')
+@attr('encryption')
+def test_encrypted_transfer_1b():
+    _test_encryption_sse_customer_write(1)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test SSE-C encrypted transfer 1KB')
+@attr(assertion='success')
+@attr('encryption')
+def test_encrypted_transfer_1kb():
+    _test_encryption_sse_customer_write(1024)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test SSE-C encrypted transfer 1MB')
+@attr(assertion='success')
+@attr('encryption')
+def test_encrypted_transfer_1MB():
+    _test_encryption_sse_customer_write(1024*1024)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test SSE-C encrypted transfer 13 bytes')
+@attr(assertion='success')
+@attr('encryption')
+def test_encrypted_transfer_13b():
+    _test_encryption_sse_customer_write(13)
+
+
+def test_encryption_sse_c_method_head():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    data = 'A'*1000
+    key = 'testobj'
+    sse_client_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.HeadObject', lf)
+    response = client.head_object(Bucket=bucket_name, Key=key)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write encrypted with SSE-C and read without SSE-C')
+@attr(assertion='operation fails')
+@attr('encryption')
+def test_encryption_sse_c_present():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    data = 'A'*1000
+    key = 'testobj'
+    sse_client_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write encrypted with SSE-C but read with other key')
+@attr(assertion='operation fails')
+@attr('encryption')
+def test_encryption_sse_c_other_key():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    data = 'A'*100
+    key = 'testobj'
+    sse_client_headers_A = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+    sse_client_headers_B = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': '6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=',
+        'x-amz-server-side-encryption-customer-key-md5': 'arxBvwY2V4SiOne6yppVPQ=='
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers_A))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers_B))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write encrypted with SSE-C, but md5 is bad')
+@attr(assertion='operation fails')
+@attr('encryption')
+def test_encryption_sse_c_invalid_md5():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    data = 'A'*100
+    key = 'testobj'
+    sse_client_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'AAAAAAAAAAAAAAAAAAAAAA=='
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key, Body=data)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write encrypted with SSE-C, but dont provide MD5')
+@attr(assertion='operation fails')
+@attr('encryption')
+def test_encryption_sse_c_no_md5():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    data = 'A'*100
+    key = 'testobj'
+    sse_client_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key, Body=data)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='declare SSE-C but do not provide key')
+@attr(assertion='operation fails')
+@attr('encryption')
+def test_encryption_sse_c_no_key():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    data = 'A'*100
+    key = 'testobj'
+    sse_client_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key, Body=data)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Do not declare SSE-C but provide key and MD5')
+@attr(assertion='operation successfull, no encryption')
+@attr('encryption')
+def test_encryption_key_no_sse_c():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    data = 'A'*100
+    key = 'testobj'
+    sse_client_headers = {
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key, Body=data)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+def _multipart_upload_enc(client, bucket_name, key, size, part_size, init_headers, part_headers, metadata, resend_parts):
+    """
+    generate a multi-part upload for a random file of specifed size,
+    if requested, generate a list of the parts
+    return the upload descriptor
+    """
+    if client == None:
+        client = get_client()
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(init_headers))
+    client.meta.events.register('before-call.s3.CreateMultipartUpload', lf)
+    if metadata == None:
+        response = client.create_multipart_upload(Bucket=bucket_name, Key=key)
+    else:
+        response = client.create_multipart_upload(Bucket=bucket_name, Key=key, Metadata=metadata)
+
+    upload_id = response['UploadId']
+    s = ''
+    parts = []
+    for i, part in enumerate(generate_random(size, part_size)):
+        # part_num is necessary because PartNumber for upload_part and in parts must start at 1 and i starts at 0
+        part_num = i+1
+        s += part
+        lf = (lambda **kwargs: kwargs['params']['headers'].update(part_headers))
+        client.meta.events.register('before-call.s3.UploadPart', lf)
+        response = client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key, PartNumber=part_num, Body=part)
+        parts.append({'ETag': response['ETag'].strip('"'), 'PartNumber': part_num})
+        if i in resend_parts:
+            lf = (lambda **kwargs: kwargs['params']['headers'].update(part_headers))
+            client.meta.events.register('before-call.s3.UploadPart', lf)
+            client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key, PartNumber=part_num, Body=part)
+
+    return (upload_id, s, parts)
+
+def _check_content_using_range_enc(client, bucket_name, key, data, step, enc_headers=None):
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    size = response['ContentLength']
+    for ofs in xrange(0, size, step):
+        toread = size - ofs
+        if toread > step:
+            toread = step
+        end = ofs + toread - 1
+        lf = (lambda **kwargs: kwargs['params']['headers'].update(enc_headers))
+        client.meta.events.register('before-call.s3.GetObject', lf)
+        r = 'bytes={s}-{e}'.format(s=ofs, e=end)
+        response = client.get_object(Bucket=bucket_name, Key=key, Range=r)
+        read_range = response['ContentLength']
+        body = _get_body(response)
+        eq(read_range, toread)
+        eq(body, data[ofs:end+1])
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='complete multi-part upload')
+@attr(assertion='successful')
+@attr('encryption')
+@attr('fails_on_aws') # allow-unordered is a non-standard extension
+def test_encryption_sse_c_multipart_upload():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = "multipart_enc"
+    content_type = 'text/plain'
+    objlen = 30 * 1024 * 1024
+    metadata = {'foo': 'bar'}
+    enc_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw==',
+        'Content-Type': content_type
+    }
+    resend_parts = []
+
+    (upload_id, data, parts) = _multipart_upload_enc(client, bucket_name, key, objlen, 
+            part_size=5*1024*1024, init_headers=enc_headers, part_headers=enc_headers, metadata=metadata, resend_parts=resend_parts)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(enc_headers))
+    client.meta.events.register('before-call.s3.CompleteMultipartUpload', lf)
+    client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+
+    response = client.head_bucket(Bucket=bucket_name)
+    rgw_object_count = int(response['ResponseMetadata']['HTTPHeaders']['x-rgw-object-count'])
+    eq(rgw_object_count, 1)
+    rgw_bytes_used = int(response['ResponseMetadata']['HTTPHeaders']['x-rgw-bytes-used'])
+    eq(rgw_bytes_used, objlen)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(enc_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+    response = client.get_object(Bucket=bucket_name, Key=key)
+
+    eq(response['Metadata'], metadata)
+    eq(response['ResponseMetadata']['HTTPHeaders']['content-type'], content_type)
+
+    body = _get_body(response)
+    eq(body, data)
+    size = response['ContentLength']
+    eq(len(body), size)
+
+    _check_content_using_range_enc(client, bucket_name, key, data, 1000000, enc_headers=enc_headers)
+    _check_content_using_range_enc(client, bucket_name, key, data, 10000000, enc_headers=enc_headers)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='multipart upload with bad key for uploading chunks')
+@attr(assertion='successful')
+@attr('encryption')
+def test_encryption_sse_c_multipart_invalid_chunks_1():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = "multipart_enc"
+    content_type = 'text/plain'
+    objlen = 30 * 1024 * 1024
+    metadata = {'foo': 'bar'}
+    init_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw==',
+        'Content-Type': content_type
+    }
+    part_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': '6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=',
+        'x-amz-server-side-encryption-customer-key-md5': 'arxBvwY2V4SiOne6yppVPQ=='
+    }
+    resend_parts = []
+
+    e = assert_raises(ClientError, _multipart_upload_enc, client=client,  bucket_name=bucket_name, 
+            key=key, size=objlen, part_size=5*1024*1024, init_headers=init_headers, part_headers=part_headers, metadata=metadata, resend_parts=resend_parts)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='multipart upload with bad md5 for chunks')
+@attr(assertion='successful')
+@attr('encryption')
+def test_encryption_sse_c_multipart_invalid_chunks_2():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = "multipart_enc"
+    content_type = 'text/plain'
+    objlen = 30 * 1024 * 1024
+    metadata = {'foo': 'bar'}
+    init_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw==',
+        'Content-Type': content_type
+    }
+    part_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'AAAAAAAAAAAAAAAAAAAAAA=='
+    }
+    resend_parts = []
+
+    e = assert_raises(ClientError, _multipart_upload_enc, client=client,  bucket_name=bucket_name, 
+            key=key, size=objlen, part_size=5*1024*1024, init_headers=init_headers, part_headers=part_headers, metadata=metadata, resend_parts=resend_parts)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='complete multi-part upload and download with bad key')
+@attr(assertion='successful')
+@attr('encryption')
+def test_encryption_sse_c_multipart_bad_download():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = "multipart_enc"
+    content_type = 'text/plain'
+    objlen = 30 * 1024 * 1024
+    metadata = {'foo': 'bar'}
+    put_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw==',
+        'Content-Type': content_type
+    }
+    get_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': '6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=',
+        'x-amz-server-side-encryption-customer-key-md5': 'arxBvwY2V4SiOne6yppVPQ=='
+    }
+    resend_parts = []
+
+    (upload_id, data, parts) = _multipart_upload_enc(client, bucket_name, key, objlen, 
+            part_size=5*1024*1024, init_headers=put_headers, part_headers=put_headers, metadata=metadata, resend_parts=resend_parts)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(put_headers))
+    client.meta.events.register('before-call.s3.CompleteMultipartUpload', lf)
+    client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+
+    response = client.head_bucket(Bucket=bucket_name)
+    rgw_object_count = int(response['ResponseMetadata']['HTTPHeaders']['x-rgw-object-count'])
+    eq(rgw_object_count, 1)
+    rgw_bytes_used = int(response['ResponseMetadata']['HTTPHeaders']['x-rgw-bytes-used'])
+    eq(rgw_bytes_used, objlen)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(put_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+    response = client.get_object(Bucket=bucket_name, Key=key)
+
+    eq(response['Metadata'], metadata)
+    eq(response['ResponseMetadata']['HTTPHeaders']['content-type'], content_type)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(get_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+
+@attr(resource='object')
+@attr(method='post')
+@attr(operation='authenticated browser based upload via POST request')
+@attr(assertion='succeeds and returns written data')
+@attr('encryption')
+def test_encryption_sse_c_post_object_authenticated_request():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    url = _get_post_url(bucket_name)
+    utc = pytz.utc
+    expires = datetime.datetime.now(utc) + datetime.timedelta(seconds=+6000)
+
+    policy_document = {"expiration": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),\
+    "conditions": [\
+    {"bucket": bucket_name},\
+    ["starts-with", "$key", "foo"],\
+    {"acl": "private"},\
+    ["starts-with", "$Content-Type", "text/plain"],\
+    ["starts-with", "$x-amz-server-side-encryption-customer-algorithm", ""], \
+    ["starts-with", "$x-amz-server-side-encryption-customer-key", ""], \
+    ["starts-with", "$x-amz-server-side-encryption-customer-key-md5", ""], \
+    ["content-length-range", 0, 1024]\
+    ]\
+    }
+
+
+    json_policy_document = json.JSONEncoder().encode(policy_document)
+    policy = base64.b64encode(json_policy_document)
+    aws_secret_access_key = get_main_aws_secret_key()
+    aws_access_key_id = get_main_aws_access_key()
+
+    signature = base64.b64encode(hmac.new(aws_secret_access_key, policy, sha).digest())
+
+    payload = OrderedDict([ ("key" , "foo.txt"),("AWSAccessKeyId" , aws_access_key_id),\
+    ("acl" , "private"),("signature" , signature),("policy" , policy),\
+    ("Content-Type" , "text/plain"),
+    ('x-amz-server-side-encryption-customer-algorithm', 'AES256'), \
+    ('x-amz-server-side-encryption-customer-key', 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs='), \
+    ('x-amz-server-side-encryption-customer-key-md5', 'DWygnHRtgiJ77HCm+1rvHw=='), \
+    ('file', ('bar'))])
+
+    r = requests.post(url, files = payload)
+    eq(r.status_code, 204)
+
+    get_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(get_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+    response = client.get_object(Bucket=bucket_name, Key='foo.txt')
+    body = _get_body(response)
+    eq(body, 'bar')
+
+def _test_sse_kms_customer_write(file_size, key_id = 'testkey-1'):
+    """
+    Tests Create a file of A's, use it to set_contents_from_file.
+    Create a file of B's, use it to re-set_contents_from_file.
+    Re-read the contents, and confirm we get B's
+    """
+    bucket_name = get_new_bucket()
+    client = get_client()
+    sse_kms_client_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': key_id
+    }
+    data = 'A'*file_size
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_kms_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key='testobj', Body=data)
+
+    response = client.get_object(Bucket=bucket_name, Key='testobj')
+    body = _get_body(response)
+    eq(body, data)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test SSE-KMS encrypted transfer 1 byte')
+@attr(assertion='success')
+@attr('encryption')
+def test_sse_kms_transfer_1b():
+    _test_sse_kms_customer_write(1)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test SSE-KMS encrypted transfer 1KB')
+@attr(assertion='success')
+@attr('encryption')
+def test_sse_kms_transfer_1kb():
+    _test_sse_kms_customer_write(1024)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test SSE-KMS encrypted transfer 1MB')
+@attr(assertion='success')
+@attr('encryption')
+def test_sse_kms_transfer_1MB():
+    _test_sse_kms_customer_write(1024*1024)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test SSE-KMS encrypted transfer 13 bytes')
+@attr(assertion='success')
+@attr('encryption')
+def test_sse_kms_transfer_13b():
+    _test_sse_kms_customer_write(13)
+
+@attr(resource='object')
+@attr(method='head')
+@attr(operation='Test SSE-KMS encrypted does perform head properly')
+@attr(assertion='success')
+@attr('encryption')
+def test_sse_kms_method_head():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    sse_kms_client_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-1'
+    }
+    data = 'A'*1000
+    key = 'testobj'
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_kms_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+
+    response = client.head_object(Bucket=bucket_name, Key=key)
+    eq(response['ResponseMetadata']['HTTPHeaders']['x-amz-server-side-encryption'], 'aws:kms')
+    eq(response['ResponseMetadata']['HTTPHeaders']['x-amz-server-side-encryption-aws-kms-key-id'], 'testkey-1')
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_kms_client_headers))
+    client.meta.events.register('before-call.s3.HeadObject', lf)
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='write encrypted with SSE-KMS and read without SSE-KMS')
+@attr(assertion='operation success')
+@attr('encryption')
+def test_sse_kms_present():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    sse_kms_client_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-1'
+    }
+    data = 'A'*100
+    key = 'testobj'
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_kms_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    body = _get_body(response)
+    eq(body, data)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='declare SSE-KMS but do not provide key_id')
+@attr(assertion='operation fails')
+@attr('encryption')
+def test_sse_kms_no_key():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    sse_kms_client_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+    }
+    data = 'A'*100
+    key = 'testobj'
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_kms_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key, Body=data)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Do not declare SSE-KMS but provide key_id')
+@attr(assertion='operation successfull, no encryption')
+@attr('encryption')
+def test_sse_kms_not_declared():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    sse_kms_client_headers = {
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-2'
+    }
+    data = 'A'*100
+    key = 'testobj'
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_kms_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key, Body=data)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='complete KMS multi-part upload')
+@attr(assertion='successful')
+@attr('encryption')
+def test_sse_kms_multipart_upload():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = "multipart_enc"
+    content_type = 'text/plain'
+    objlen = 30 * 1024 * 1024
+    metadata = {'foo': 'bar'}
+    enc_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-2',
+        'Content-Type': content_type
+    }
+    resend_parts = []
+
+    (upload_id, data, parts) = _multipart_upload_enc(client, bucket_name, key, objlen, 
+            part_size=5*1024*1024, init_headers=enc_headers, part_headers=enc_headers, metadata=metadata, resend_parts=resend_parts)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(enc_headers))
+    client.meta.events.register('before-call.s3.CompleteMultipartUpload', lf)
+    client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+
+    response = client.head_bucket(Bucket=bucket_name)
+    rgw_object_count = int(response['ResponseMetadata']['HTTPHeaders']['x-rgw-object-count'])
+    eq(rgw_object_count, 1)
+    rgw_bytes_used = int(response['ResponseMetadata']['HTTPHeaders']['x-rgw-bytes-used'])
+    eq(rgw_bytes_used, objlen)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(part_headers))
+    client.meta.events.register('before-call.s3.UploadPart', lf)
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+
+    eq(response['Metadata'], metadata)
+    eq(response['ResponseMetadata']['HTTPHeaders']['content-type'], content_type)
+
+    body = _get_body(response)
+    eq(body, data)
+    size = response['ContentLength']
+    eq(len(body), size)
+
+    _check_content_using_range(key, bucket_name, data, 1000000)
+    _check_content_using_range(key, bucket_name, data, 10000000)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='multipart KMS upload with bad key_id for uploading chunks')
+@attr(assertion='successful')
+@attr('encryption')
+def test_sse_kms_multipart_invalid_chunks_1():
