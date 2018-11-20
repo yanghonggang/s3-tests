@@ -7708,8 +7708,7 @@ def _do_create_versioned_obj_concurrent(client, bucket_name, key, num):
 def _do_clear_versioned_bucket_concurrent(client, bucket_name):
     t = []
     response = client.list_object_versions(Bucket=bucket_name)
-    versions = response['Versions']
-    for version in versions:
+    for version in response.get('Versions', []):
         thr = threading.Thread(target = _do_remove_ver, args=(client, bucket_name, version['Key'], version['VersionId']))
         thr.start()
         t.append(thr)
@@ -7765,23 +7764,21 @@ def test_versioned_concurrent_object_create_and_remove():
     all_threads = []
 
     for i in xrange(3):
+
         t = _do_create_versioned_obj_concurrent(client, bucket_name, key, num_versions)
+        all_threads.append(t)
 
-        # TODO: fix this one, ask Casey about it, I can't have the do_wait_completion here
-        #_do_wait_completion(t)
         t = _do_clear_versioned_bucket_concurrent(client, bucket_name)
+        all_threads.append(t)
 
-        #t = _do_create_versioned_obj_concurrent(client, bucket_name, key, num_versions)
-        #all_threads.append(t)
+    for t in all_threads:
+        _do_wait_completion(t)
 
-        #t = _do_clear_versioned_bucket_concurrent(client, bucket_name)
-        #all_threads.append(t)
+    t = _do_clear_versioned_bucket_concurrent(client, bucket_name)
+    _do_wait_completion(t)
 
-    #for t in all_threads:
-        #_do_wait_completion(t)
-
-    #t = _do_clear_versioned_bucket_concurrent(client, bucket_name)
-    #_do_wait_completion(t)
+    response = client.list_object_versions(Bucket=bucket_name)
+    eq(('Versions' in response), False)
 
 def _test_encryption_sse_customer_write(file_size):
     """
@@ -8472,9 +8469,415 @@ def test_sse_kms_multipart_upload():
     _check_content_using_range(key, bucket_name, data, 1000000)
     _check_content_using_range(key, bucket_name, data, 10000000)
 
+
 @attr(resource='object')
 @attr(method='put')
 @attr(operation='multipart KMS upload with bad key_id for uploading chunks')
 @attr(assertion='successful')
 @attr('encryption')
 def test_sse_kms_multipart_invalid_chunks_1():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = "multipart_enc"
+    content_type = 'text/bla'
+    objlen = 30 * 1024 * 1024
+    metadata = {'foo': 'bar'}
+    init_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-1',
+        'Content-Type': content_type
+    }
+    part_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-2'
+    }
+    resend_parts = []
+
+    _multipart_upload_enc(client, bucket_name, key, objlen, part_size=5*1024*1024, 
+            init_headers=init_headers, part_headers=part_headers, metadata=metadata, 
+            resend_parts=resend_parts)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='multipart KMS upload with unexistent key_id for chunks')
+@attr(assertion='successful')
+@attr('encryption')
+def test_sse_kms_multipart_invalid_chunks_2():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = "multipart_enc"
+    content_type = 'text/plain'
+    objlen = 30 * 1024 * 1024
+    metadata = {'foo': 'bar'}
+    init_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-1',
+        'Content-Type': content_type
+    }
+    part_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-not-present'
+    }
+    resend_parts = []
+
+    _multipart_upload_enc(client, bucket_name, key, objlen, part_size=5*1024*1024, 
+            init_headers=init_headers, part_headers=part_headers, metadata=metadata, 
+            resend_parts=resend_parts)
+
+@attr(resource='object')
+@attr(method='post')
+@attr(operation='authenticated KMS browser based upload via POST request')
+@attr(assertion='succeeds and returns written data')
+@attr('encryption')
+def test_sse_kms_post_object_authenticated_request():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    url = _get_post_url(bucket_name)
+    utc = pytz.utc
+    expires = datetime.datetime.now(utc) + datetime.timedelta(seconds=+6000)
+
+    policy_document = {"expiration": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),\
+    "conditions": [\
+    {"bucket": bucket_name},\
+    ["starts-with", "$key", "foo"],\
+    {"acl": "private"},\
+    ["starts-with", "$Content-Type", "text/plain"],\
+    ["starts-with", "$x-amz-server-side-encryption", ""], \
+    ["starts-with", "$x-amz-server-side-encryption-aws-kms-key-id", ""], \
+    ["content-length-range", 0, 1024]\
+    ]\
+    }
+
+
+    json_policy_document = json.JSONEncoder().encode(policy_document)
+    policy = base64.b64encode(json_policy_document)
+    aws_secret_access_key = get_main_aws_secret_key()
+    aws_access_key_id = get_main_aws_access_key()
+
+    signature = base64.b64encode(hmac.new(aws_secret_access_key, policy, sha).digest())
+
+    payload = OrderedDict([ ("key" , "foo.txt"),("AWSAccessKeyId" , aws_access_key_id),\
+    ("acl" , "private"),("signature" , signature),("policy" , policy),\
+    ("Content-Type" , "text/plain"),
+    ('x-amz-server-side-encryption', 'aws:kms'), \
+    ('x-amz-server-side-encryption-aws-kms-key-id', 'testkey-1'), \
+    ('file', ('bar'))])
+
+    r = requests.post(url, files = payload)
+    eq(r.status_code, 204)
+
+    response = client.get_object(Bucket=bucket_name, Key='foo.txt')
+    body = _get_body(response)
+    eq(body, 'bar')
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='write encrypted with SSE-KMS and read with SSE-KMS')
+@attr(assertion='operation fails')
+@attr('encryption')
+def test_sse_kms_read_declare():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    sse_kms_client_headers = {
+        'x-amz-server-side-encryption': 'aws:kms',
+        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-1'
+    }
+    data = 'A'*100
+    key = 'testobj'
+
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_kms_client_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='Test Bucket Policy')
+@attr(assertion='succeeds')
+@attr('bucket-policy')
+def test_bucket_policy():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'asdf'
+    client.put_object(Bucket=bucket_name, Key=key, Body='asdf')
+
+    resource1 = "arn:aws:s3:::" + bucket_name
+    resource2 = "arn:aws:s3:::" + bucket_name + "/*"
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+        "Effect": "Allow",
+        "Principal": {"AWS": "*"},
+        "Action": "s3:ListBucket",
+        "Resource": [
+            "{}".format(resource1),
+            "{}".format(resource2)
+          ]
+        }]
+     })
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    alt_client = get_alt_client()
+    response = alt_client.list_objects(Bucket=bucket_name)
+    eq(len(response['Contents']), 1)
+
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='Test Bucket Policy and ACL')
+@attr(assertion='fails')
+@attr('bucket-policy')
+def test_bucket_policy_acl():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'asdf'
+    client.put_object(Bucket=bucket_name, Key=key, Body='asdf')
+
+    resource1 = "arn:aws:s3:::" + bucket_name
+    resource2 = "arn:aws:s3:::" + bucket_name + "/*"
+    policy_document =  json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+        "Effect": "Deny",
+        "Principal": {"AWS": "*"},
+        "Action": "s3:ListBucket",
+        "Resource": [
+            "{}".format(resource1),
+            "{}".format(resource2)
+          ]
+        }]
+     })
+
+    client.put_bucket_acl(Bucket=bucket_name, ACL='authenticated-read')
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    alt_client = get_alt_client()
+    e = assert_raises(ClientError, alt_client.list_objects, Bucket=bucket_name)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+    eq(error_code, 'AccessDenied')
+
+    client.delete_bucket_policy(Bucket=bucket_name)
+    client.put_bucket_acl(Bucket=bucket_name, ACL='public-read')
+
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='Test Bucket Policy for a user belonging to a different tenant')
+@attr(assertion='succeeds')
+@attr('bucket-policy')
+def test_bucket_policy_different_tenant():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'asdf'
+    client.put_object(Bucket=bucket_name, Key=key, Body='asdf')
+
+    resource1 = "arn:aws:s3::*:" + bucket_name
+    resource2 = "arn:aws:s3::*:" + bucket_name + "/*"
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+        "Effect": "Allow",
+        "Principal": {"AWS": "*"},
+        "Action": "s3:ListBucket",
+        "Resource": [
+            "{}".format(resource1),
+            "{}".format(resource2)
+          ]
+        }]
+     })
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    #TODO: figure out where 'tenant' user comes from
+    alt_client = get_alt_client()
+    response = alt_client.list_objects(Bucket=bucket_name)
+    eq(len(response['Contents']), 1)
+
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='Test Bucket Policy on another bucket')
+@attr(assertion='succeeds')
+@attr('bucket-policy')
+def test_bucket_policy_another_bucket():
+    bucket_name = get_new_bucket()
+    bucket_name2 = get_new_bucket()
+    client = get_client()
+    key = 'asdf'
+    key2 = 'abcd'
+    client.put_object(Bucket=bucket_name, Key=key, Body='asdf')
+    client.put_object(Bucket=bucket_name2, Key=key2, Body='abcd')
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+        "Effect": "Allow",
+        "Principal": {"AWS": "*"},
+        "Action": "s3:ListBucket",
+        "Resource": [
+            "arn:aws:s3:::*",
+            "arn:aws:s3:::*/*"
+          ]
+        }]
+     })
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    response = client.get_bucket_policy(Bucket=bucket_name)
+    response_policy = response['Policy']
+
+    client.put_bucket_policy(Bucket=bucket_name2, Policy=response_policy)
+
+    #TODO: figure out where 'tenant' user comes from
+    alt_client = get_alt_client()
+    response = alt_client.list_objects(Bucket=bucket_name)
+    eq(len(response['Contents']), 1)
+
+    alt_client = get_alt_client()
+    response = alt_client.list_objects(Bucket=bucket_name2)
+    eq(len(response['Contents']), 1)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='Test put condition operator end with ifExists')
+@attr('bucket-policy')
+def test_bucket_policy_set_condition_operator_end_with_IfExists():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'foo'
+    client.put_object(Bucket=bucket_name, Key=key)
+    policy = '''{
+      "Version":"2012-10-17",
+      "Statement": [{
+        "Sid": "Allow Public Access to All Objects",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Condition": {
+                    "StringLikeIfExists": {
+                        "aws:Referer": "http://www.example.com/*"
+                    }
+                },
+        "Resource": "arn:aws:s3:::%s/*"
+      }
+     ]
+    }''' % bucket_name
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy)
+
+    request_headers={'referer': 'http://www.example.com/'}
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(request_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    request_headers={'referer': 'http://www.example.com/index.html'}
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(request_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    request_headers={'referer': 'http://example.com'}
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(request_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+
+    # TODO: Ask why this is not a 403 and is succeeding
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+def _create_simple_tagset(count):
+    tagset = []
+    for i in range(count):
+        tagset.append({'Key': str(i), 'Value': str(i)})
+
+    return {'TagSet': tagset}
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test Get/PutObjTagging output')
+@attr(assertion='success')
+@attr('tagging')
+def test_get_obj_tagging():
+    key = 'testputtags'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    input_tagset = _create_simple_tagset(2)
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['TagSet'], input_tagset['TagSet'])
+
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test HEAD obj tagging output')
+@attr(assertion='success')
+@attr('tagging')
+def test_get_obj_head_tagging():
+    key = 'testputtags'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+    count = 2
+
+    input_tagset = _create_simple_tagset(count)
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.head_object(Bucket=bucket_name, Key=key)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+    eq(response['ResponseMetadata']['HTTPHeaders']['x-amz-tagging-count'], str(count))
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test Put max allowed tags')
+@attr(assertion='success')
+@attr('tagging')
+def test_put_max_tags():
+    key = 'testputmaxtags'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    input_tagset = _create_simple_tagset(10)
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['TagSet'], input_tagset['TagSet'])
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test Put max allowed tags')
+@attr(assertion='fails')
+@attr('tagging')
+def test_put_excess_tags():
+    key = 'testputmaxtags'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    input_tagset = _create_simple_tagset(11)
+    e = assert_raises(ClientError, client.put_object_tagging, Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'InvalidTag')
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(len(response['TagSet']), 0)
+
+
+
