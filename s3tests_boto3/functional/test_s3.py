@@ -31,6 +31,8 @@ from email.header import decode_header
 from .utils import assert_raises
 from .utils import generate_random
 
+from .policy import Policy, Statement, make_json_policy
+
 from . import (
     get_client,
     get_prefix,
@@ -8806,6 +8808,10 @@ def _create_simple_tagset(count):
 
     return {'TagSet': tagset}
 
+def _make_random_string(size):
+    return ''.join(random.choice(string.ascii_letters) for _ in range(size))
+
+
 @attr(resource='object')
 @attr(method='get')
 @attr(operation='Test Get/PutObjTagging output')
@@ -8879,5 +8885,964 @@ def test_put_excess_tags():
     response = client.get_object_tagging(Bucket=bucket_name, Key=key)
     eq(len(response['TagSet']), 0)
 
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test Put max allowed k-v size')
+@attr(assertion='success')
+@attr('tagging')
+def test_put_max_kvsize_tags():
+    key = 'testputmaxkeysize'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
 
+    tagset = []
+    for i in range(10):
+        k = _make_random_string(128)
+        v = _make_random_string(256)
+        tagset.append({'Key': k, 'Value': v})
+
+    input_tagset = {'TagSet': tagset}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    for kv_pair in response['TagSet']:
+        eq((kv_pair in input_tagset['TagSet']), True)
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test exceed key size')
+@attr(assertion='success')
+@attr('tagging')
+def test_put_excess_key_tags():
+    key = 'testputexcesskeytags'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    tagset = []
+    for i in range(10):
+        k = _make_random_string(129)
+        v = _make_random_string(256)
+        tagset.append({'Key': k, 'Value': v})
+
+    input_tagset = {'TagSet': tagset}
+
+    e = assert_raises(ClientError, client.put_object_tagging, Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'InvalidTag')
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(len(response['TagSet']), 0)
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test exceed val size')
+@attr(assertion='success')
+@attr('tagging')
+def test_put_excess_val_tags():
+    key = 'testputexcesskeytags'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    tagset = []
+    for i in range(10):
+        k = _make_random_string(128)
+        v = _make_random_string(257)
+        tagset.append({'Key': k, 'Value': v})
+
+    input_tagset = {'TagSet': tagset}
+
+    e = assert_raises(ClientError, client.put_object_tagging, Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'InvalidTag')
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(len(response['TagSet']), 0)
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test PUT modifies existing tags')
+@attr(assertion='success')
+@attr('tagging')
+def test_put_modify_tags():
+    key = 'testputmodifytags'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    tagset = []
+    tagset.append({'Key': 'key', 'Value': 'val'})
+    tagset.append({'Key': 'key2', 'Value': 'val2'})
+
+    input_tagset = {'TagSet': tagset}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['TagSet'], input_tagset['TagSet'])
+
+    tagset2 = []
+    tagset2.append({'Key': 'key3', 'Value': 'val3'})
+
+    input_tagset2 = {'TagSet': tagset2}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset2)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['TagSet'], input_tagset2['TagSet'])
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test Delete tags')
+@attr(assertion='success')
+@attr('tagging')
+def test_put_delete_tags():
+    key = 'testputmodifytags'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    input_tagset = _create_simple_tagset(2)
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['TagSet'], input_tagset['TagSet'])
+
+    response = client.delete_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 204)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(len(response['TagSet']), 0)
+
+@attr(resource='object')
+@attr(method='post')
+@attr(operation='anonymous browser based upload via POST request')
+@attr('tagging')
+@attr(assertion='succeeds and returns written data')
+def test_post_object_tags_anonymous_request():
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    url = _get_post_url(bucket_name)
+    client.create_bucket(ACL='public-read-write', Bucket=bucket_name)
+
+    key_name = "foo.txt"
+    input_tagset = _create_simple_tagset(2)
+
+    payload = OrderedDict([
+        ("key" , key_name),
+        ("acl" , "public-read"),
+        ("Content-Type" , "text/plain"),
+        # TODO figure out how to provide the input correctly
+        #("tagging", input_tagset.to_xml()),
+        ('file', ('bar')),
+    ])
+
+    r = requests.post(url, files = payload)
+    eq(r.status_code, 204)
+    response = client.get_object(Bucket=bucket_name, Key=key_name)
+    body = _get_body(response)
+    eq(body, 'bar')
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key_name)
+    eq(response['TagSet'], input_tagset['TagSet'])
+
+@attr(resource='object')
+@attr(method='post')
+@attr(operation='authenticated browser based upload via POST request')
+@attr('tagging')
+@attr(assertion='succeeds and returns written data')
+def test_post_object_tags_authenticated_request():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    input_tagset = _create_simple_tagset(2)
+
+    url = _get_post_url(bucket_name)
+    utc = pytz.utc
+    expires = datetime.datetime.now(utc) + datetime.timedelta(seconds=+6000)
+
+    policy_document = {"expiration": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),\
+    "conditions": [\
+    {"bucket": bucket_name},\
+    ["starts-with", "$key", "foo"],\
+    {"acl": "private"},\
+    ["starts-with", "$Content-Type", "text/plain"],\
+    ["content-length-range", 0, 1024]\
+    ]\
+    }
+
+
+    json_policy_document = json.JSONEncoder().encode(policy_document)
+    policy = base64.b64encode(json_policy_document)
+    aws_secret_access_key = get_main_aws_secret_key()
+    aws_access_key_id = get_main_aws_access_key()
+
+    signature = base64.b64encode(hmac.new(aws_secret_access_key, policy, sha).digest())
+
+    payload = OrderedDict([ 
+        ("key" , "foo.txt"),
+        ("AWSAccessKeyId" , aws_access_key_id),\
+        ("acl" , "private"),("signature" , signature),("policy" , policy),\
+        # TODO figure out how to provide the input correctly
+        #("tagging", input_tagset.to_xml()),
+        ("Content-Type" , "text/plain"),
+        ('file', ('bar'))])
+
+    r = requests.post(url, files = payload)
+    eq(r.status_code, 204)
+    response = client.get_object(Bucket=bucket_name, Key='foo.txt')
+    body = _get_body(response)
+    eq(body, 'bar')
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test PutObj with tagging headers')
+@attr(assertion='success')
+@attr('tagging')
+def test_put_obj_with_tags():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'testtagobj1'
+    data = 'A'*100
+
+    tagset = []
+    tagset.append({'Key': 'foo', 'Value': 'bar'})
+    #tagset.append({'Key': 'bar', 'Value': ''})
+    tagset = {'Key': 'foo', 'Value': 'bar'}
+
+    #input_tagset = {'TagSet': tagset}
+    # TODO: run this in boto2 and see what input_tagset is when you print it out and what the return values look like
+    input_tagset = '<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet><Tag><Value>0</Value><Key>0</Key></Tag><Tag><Value>1</Value><Key>1</Key></Tag></TagSet></Tagging>'
+    put_obj_tag_headers = {
+        'x-amz-tagging' : input_tagset
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(put_obj_tag_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    body = _get_body(response)
+    eq(body, data)
+
+    input_tagset = _create_simple_tagset(2)
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    #eq(response['TagSet'], input_tagset)
+    print response['TagSet']
+
+def _make_arn_resource(path="*"):
+    return "arn:aws:s3:::{}".format(path)
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test GetObjTagging public read')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_get_tags_acl_public():
+    key = 'testputtagsacl'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, key))
+    policy_document = make_json_policy("s3:GetObjectTagging",
+                                       resource)
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    input_tagset = _create_simple_tagset(10)
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    alt_client = get_alt_client()
+
+    response = alt_client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['TagSet'], input_tagset['TagSet'])
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test PutObjTagging public wrote')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_put_tags_acl_public():
+    key = 'testputtagsacl'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, key))
+    policy_document = make_json_policy("s3:PutObjectTagging",
+                                       resource)
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    input_tagset = _create_simple_tagset(10)
+    alt_client = get_alt_client()
+    response = alt_client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['TagSet'], input_tagset['TagSet'])
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='test deleteobjtagging public')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_delete_tags_obj_public():
+    key = 'testputtagsacl'
+    bucket_name = _create_key_with_random_content(key)
+    client = get_client()
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, key))
+    policy_document = make_json_policy("s3:DeleteObjectTagging",
+                                       resource)
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    input_tagset = _create_simple_tagset(10)
+    response = client.put_object_tagging(Bucket=bucket_name, Key=key, Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    alt_client = get_alt_client()
+
+    response = alt_client.delete_object_tagging(Bucket=bucket_name, Key=key)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 204)
+
+    response = client.get_object_tagging(Bucket=bucket_name, Key=key)
+    eq(len(response['TagSet']), 0)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='test whether a correct version-id returned')
+@attr(assertion='version-id is same as bucket list')
+def test_versioning_bucket_atomic_upload_return_version_id():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'bar'
+
+    # for versioning-enabled-bucket, an non-empty version-id should return
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    response = client.put_object(Bucket=bucket_name, Key=key)
+    version_id = response['VersionId']
+
+    response  = client.list_object_versions(Bucket=bucket_name)
+    versions = response['Versions']
+    for version in versions:
+        eq(version['VersionId'], version_id) 
+
+
+    # for versioning-default-bucket, no version-id should return.
+    bucket_name = get_new_bucket()
+    key = 'baz'
+    response = client.put_object(Bucket=bucket_name, Key=key)
+    eq(('VersionId' in response), False)
+
+    # for versioning-suspended-bucket, no version-id should return.
+    bucket_name = get_new_bucket()
+    key = 'baz'
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+    response = client.put_object(Bucket=bucket_name, Key=key)
+    eq(('VersionId' in response), False)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='test whether a correct version-id returned')
+@attr(assertion='version-id is same as bucket list')
+def test_versioning_bucket_multipart_upload_return_version_id():
+    content_type='text/bla'
+    objlen = 30 * 1024 * 1024
+
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'bar'
+    metadata={'foo': 'baz'}
+
+    # for versioning-enabled-bucket, an non-empty version-id should return
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    (upload_id, data, parts) = _multipart_upload(bucket_name=bucket_name, key=key, size=objlen, client=client, content_type=content_type, metadata=metadata)
+
+    response = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+    version_id = response['VersionId']
+
+    response  = client.list_object_versions(Bucket=bucket_name)
+    versions = response['Versions']
+    for version in versions:
+        eq(version['VersionId'], version_id) 
+
+    # for versioning-default-bucket, no version-id should return.
+    bucket_name = get_new_bucket()
+    key = 'baz'
+
+    (upload_id, data, parts) = _multipart_upload(bucket_name=bucket_name, key=key, size=objlen, client=client, content_type=content_type, metadata=metadata)
+
+    response = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+    eq(('VersionId' in response), False)
+
+    # for versioning-suspended-bucket, no version-id should return
+    bucket_name = get_new_bucket()
+    key = 'foo'
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+
+    (upload_id, data, parts) = _multipart_upload(bucket_name=bucket_name, key=key, size=objlen, client=client, content_type=content_type, metadata=metadata)
+
+    response = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+    eq(('VersionId' in response), False)
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test ExistingObjectTag conditional on get object')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_bucket_policy_get_obj_existing_tag():
+    bucket_name = _create_objects(keys=['publictag', 'privatetag', 'invalidtag'])
+    client = get_client()
+
+    tag_conditional = {"StringEquals": {
+        "s3:ExistingObjectTag/security" : "public"
+    }}
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:GetObject",
+                                       resource,
+                                       conditions=tag_conditional)
+
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    tagset = []
+    tagset.append({'Key': 'security', 'Value': 'public'})
+    tagset.append({'Key': 'foo', 'Value': 'bar'})
+
+    input_tagset = {'TagSet': tagset}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='publictag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    tagset2 = []
+    tagset2.append({'Key': 'security', 'Value': 'private'})
+
+    input_tagset = {'TagSet': tagset2}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='privatetag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    tagset3 = []
+    tagset3.append({'Key': 'security1', 'Value': 'public'})
+
+    input_tagset = {'TagSet': tagset3}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='invalidtag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    alt_client = get_alt_client()
+    response = alt_client.get_object(Bucket=bucket_name, Key='publictag')
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    e = assert_raises(ClientError, alt_client.get_object, Bucket=bucket_name, Key='privatetag')
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+    e = assert_raises(ClientError, alt_client.get_object, Bucket=bucket_name, Key='invalidtag')
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test ExistingObjectTag conditional on get object tagging')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_bucket_policy_get_obj_tagging_existing_tag():
+    bucket_name = _create_objects(keys=['publictag', 'privatetag', 'invalidtag'])
+    client = get_client()
+
+    tag_conditional = {"StringEquals": {
+        "s3:ExistingObjectTag/security" : "public"
+    }}
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:GetObjectTagging",
+                                       resource,
+                                       conditions=tag_conditional)
+
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    tagset = []
+    tagset.append({'Key': 'security', 'Value': 'public'})
+    tagset.append({'Key': 'foo', 'Value': 'bar'})
+
+    input_tagset = {'TagSet': tagset}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='publictag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    tagset2 = []
+    tagset2.append({'Key': 'security', 'Value': 'private'})
+
+    input_tagset = {'TagSet': tagset2}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='privatetag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    tagset3 = []
+    tagset3.append({'Key': 'security1', 'Value': 'public'})
+
+    input_tagset = {'TagSet': tagset3}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='invalidtag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    alt_client = get_alt_client()
+    response = alt_client.get_object_tagging(Bucket=bucket_name, Key='publictag')
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    # A get object itself should fail since we allowed only GetObjectTagging
+    e = assert_raises(ClientError, alt_client.get_object, Bucket=bucket_name, Key='publictag')
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+    e = assert_raises(ClientError, alt_client.get_object_tagging, Bucket=bucket_name, Key='privatetag')
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+
+    e = assert_raises(ClientError, alt_client.get_object_tagging, Bucket=bucket_name, Key='invalidtag')
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test ExistingObjectTag conditional on put object tagging')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_bucket_policy_put_obj_tagging_existing_tag():
+    bucket_name = _create_objects(keys=['publictag', 'privatetag', 'invalidtag'])
+    client = get_client()
+
+    tag_conditional = {"StringEquals": {
+        "s3:ExistingObjectTag/security" : "public"
+    }}
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:PutObjectTagging",
+                                       resource,
+                                       conditions=tag_conditional)
+
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    tagset = []
+    tagset.append({'Key': 'security', 'Value': 'public'})
+    tagset.append({'Key': 'foo', 'Value': 'bar'})
+
+    input_tagset = {'TagSet': tagset}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='publictag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    tagset2 = []
+    tagset2.append({'Key': 'security', 'Value': 'private'})
+
+    input_tagset = {'TagSet': tagset2}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='privatetag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    alt_client = get_alt_client()
+    # PUT requests with object tagging are a bit wierd, if you forget to put
+    # the tag which is supposed to be existing anymore well, well subsequent
+    # put requests will fail
+
+    testtagset1 = []
+    testtagset1.append({'Key': 'security', 'Value': 'public'})
+    testtagset1.append({'Key': 'foo', 'Value': 'bar'})
+
+    input_tagset = {'TagSet': testtagset1}
+
+    response = alt_client.put_object_tagging(Bucket=bucket_name, Key='publictag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    e = assert_raises(ClientError, alt_client.put_object_tagging, Bucket=bucket_name, Key='privatetag', Tagging=input_tagset)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+    testtagset2 = []
+    testtagset2.append({'Key': 'security', 'Value': 'private'})
+
+    input_tagset = {'TagSet': testtagset2}
+
+    response = alt_client.put_object_tagging(Bucket=bucket_name, Key='publictag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    # Now try putting the original tags again, this should fail
+    input_tagset = {'TagSet': testtagset1}
+
+    e = assert_raises(ClientError, alt_client.put_object_tagging, Bucket=bucket_name, Key='publictag', Tagging=input_tagset)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test copy-source conditional on put obj')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_bucket_policy_put_obj_copy_source():
+    bucket_name = _create_objects(keys=['public/foo', 'public/bar', 'private/foo'])
+    client = get_client()
+
+    src_resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:GetObject",
+                                       src_resource)
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    bucket_name2 = get_new_bucket()
+
+    tag_conditional = {"StringLike": {
+        "s3:x-amz-copy-source" : bucket_name + "/public/*"
+    }}
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name2, "*"))
+    policy_document = make_json_policy("s3:PutObject",
+                                       resource,
+                                       conditions=tag_conditional)
+
+    client.put_bucket_policy(Bucket=bucket_name2, Policy=policy_document)
+
+    alt_client = get_alt_client()
+    copy_source = {'Bucket': bucket_name, 'Key': 'public/foo'}
+
+    alt_client.copy_object(Bucket=bucket_name2, CopySource=copy_source, Key='new_foo')
+
+    # This is possible because we are still the owner, see the grants with
+    # policy on how to do this right
+    response = alt_client.get_object(Bucket=bucket_name2, Key='new_foo')
+    body = _get_body(response)
+    eq(body, 'public/foo')
+    
+    copy_source = {'Bucket': bucket_name, 'Key': 'public/bar'}
+    alt_client.copy_object(Bucket=bucket_name2, CopySource=copy_source, Key='new_foo2')
+
+    response = alt_client.get_object(Bucket=bucket_name2, Key='new_foo2')
+    body = _get_body(response)
+    eq(body, 'public/bar')
+
+    copy_source = {'Bucket': bucket_name, 'Key': 'private/foo'}
+    check_access_denied(alt_client.copy_object, Bucket=bucket_name2, CopySource=copy_source, Key='new_foo2')
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test copy-source conditional on put obj')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_bucket_policy_put_obj_copy_source_meta():
+    src_bucket_name = _create_objects(keys=['public/foo', 'public/bar'])
+    client = get_client()
+
+    src_resource = _make_arn_resource("{}/{}".format(src_bucket_name, "*"))
+    policy_document = make_json_policy("s3:GetObject",
+                                       src_resource)
+
+    client.put_bucket_policy(Bucket=src_bucket_name, Policy=policy_document)
+
+    bucket_name = get_new_bucket()
+
+    tag_conditional = {"StringEquals": {
+        "s3:x-amz-metadata-directive" : "COPY"
+    }}
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:PutObject",
+                                       resource,
+                                       conditions=tag_conditional)
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    alt_client = get_alt_client()
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update({"x-amz-metadata-directive": "COPY"}))
+    alt_client.meta.events.register('before-call.s3.CopyObject', lf)
+
+    copy_source = {'Bucket': src_bucket_name, 'Key': 'public/foo'}
+    alt_client.copy_object(Bucket=bucket_name, CopySource=copy_source, Key='new_foo')
+
+    # This is possible because we are still the owner, see the grants with
+    # policy on how to do this right
+    response = alt_client.get_object(Bucket=bucket_name, Key='new_foo')
+    body = _get_body(response)
+    eq(body, 'public/foo')
+
+    # remove the x-amz-metadata-directive header
+    def remove_header(**kwargs):
+        if ("x-amz-metadata-directive" in kwargs['params']['headers']):
+            del kwargs['params']['headers']["x-amz-metadata-directive"]
+
+    alt_client.meta.events.register('before-call.s3.CopyObject', remove_header)
+    
+    copy_source = {'Bucket': src_bucket_name, 'Key': 'public/bar'}
+    check_access_denied(alt_client.copy_object, Bucket=bucket_name, CopySource=copy_source, Key='new_foo2', Metadata={"foo": "bar"})
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test put obj with canned-acl not to be public')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_bucket_policy_put_obj_acl():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    # An allow conditional will require atleast the presence of an x-amz-acl
+    # attribute a Deny conditional would negate any requests that try to set a
+    # public-read/write acl
+    conditional = {"StringLike": {
+        "s3:x-amz-acl" : "public*"
+    }}
+
+    p = Policy()
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    s1 = Statement("s3:PutObject",resource)
+    s2 = Statement("s3:PutObject", resource, effect="Deny", condition=conditional)
+
+    policy_document = p.add_statement(s1).add_statement(s2).to_json()
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    alt_client = get_alt_client()
+    key1 = 'private-key'
+
+    # if we want to be really pedantic, we should check that this doesn't raise
+    # and mark a failure, however if this does raise nosetests would mark this
+    # as an ERROR anyway
+    response = alt_client.put_object(Bucket=bucket_name, Key=key1, Body=key1)
+    #response = alt_client.put_object_acl(Bucket=bucket_name, Key=key1, ACL='private')
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    key2 = 'public-key'
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update({"x-amz-acl": "public-read"}))
+    alt_client.meta.events.register('before-call.s3.PutObject', lf)
+
+    e = assert_raises(ClientError, alt_client.put_object, Bucket=bucket_name, Key=key2, Body=key2)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Test put obj with amz-grant back to bucket-owner')
+@attr(assertion='success')
+@attr('bucket-policy')
+def test_bucket_policy_put_obj_grant():
+
+    bucket_name = get_new_bucket()
+    bucket_name2 = get_new_bucket()
+    client = get_client()
+
+    # In normal cases a key owner would be the uploader of a key in first case
+    # we explicitly require that the bucket owner is granted full control over
+    # the object uploaded by any user, the second bucket is where no such
+    # policy is enforced meaning that the uploader still retains ownership
+
+    main_user_id = get_main_user_id()
+    alt_user_id = get_alt_user_id()
+
+    owner_id_str = "id=" + main_user_id
+    s3_conditional = {"StringEquals": {
+        "s3:x-amz-grant-full-control" : owner_id_str
+    }}
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:PutObject",
+                                       resource,
+                                       conditions=s3_conditional)
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name2, "*"))
+    policy_document2 = make_json_policy("s3:PutObject", resource)
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    client.put_bucket_policy(Bucket=bucket_name2, Policy=policy_document2)
+
+    alt_client = get_alt_client()
+    key1 = 'key1'
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update({"x-amz-grant-full-control" : owner_id_str}))
+    alt_client.meta.events.register('before-call.s3.PutObject', lf)
+
+    response = alt_client.put_object(Bucket=bucket_name, Key=key1, Body=key1)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    def remove_header(**kwargs):
+        if ("x-amz-grant-full-control" in kwargs['params']['headers']):
+            del kwargs['params']['headers']["x-amz-grant-full-control"]
+
+    alt_client.meta.events.register('before-call.s3.PutObject', remove_header)
+
+    key2 = 'key2'
+    response = alt_client.put_object(Bucket=bucket_name2, Key=key2, Body=key2)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    acl1_response = client.get_object_acl(Bucket=bucket_name, Key=key1)
+
+    # user 1 is trying to get acl for the object from user2 where ownership
+    # wasn't transferred
+    check_access_denied(client.get_object_acl, Bucket=bucket_name2, Key=key2)
+
+    acl2_response = alt_client.get_object_acl(Bucket=bucket_name2, Key=key2)
+
+    eq(acl1_response['Grants'][0]['Grantee']['ID'], main_user_id)
+    eq(acl2_response['Grants'][0]['Grantee']['ID'], alt_user_id)
+
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='Deny put obj requests without encryption')
+@attr(assertion='success')
+@attr('encryption')
+@attr('bucket-policy')
+def test_bucket_policy_put_obj_enc():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    deny_incorrect_algo = {
+        "StringNotEquals": {
+          "s3:x-amz-server-side-encryption": "AES256"
+        }
+    }
+
+    deny_unencrypted_obj = {
+        "Null" : {
+          "s3:x-amz-server-side-encryption": "true"
+        }
+    }
+
+    p = Policy()
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+
+    s1 = Statement("s3:PutObject", resource, effect="Deny", condition=deny_incorrect_algo)
+    s2 = Statement("s3:PutObject", resource, effect="Deny", condition=deny_unencrypted_obj)
+    policy_document = p.add_statement(s1).add_statement(s2).to_json()
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    key1_str ='testobj'
+
+    check_access_denied(client.put_object, Bucket=bucket_name, Key=key1_str, Body=key1_str)
+
+    sse_client_headers = {
+        'x-amz-server-side-encryption' : 'AES256',
+        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    #TODO: why is this a 400 and not passing
+    client.put_object(Bucket=bucket_name, Key=key1_str, Body=key1_str)
+
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='put obj with RequestObjectTag')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_bucket_policy_put_obj_request_obj_tag():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    tag_conditional = {"StringEquals": {
+        "s3:RequestObjectTag/security" : "public"
+    }}
+
+    p = Policy()
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+
+    s1 = Statement("s3:PutObject", resource, effect="Allow", condition=tag_conditional)
+    policy_document = p.add_statement(s1).to_json()
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    alt_client = get_alt_client()
+    key1_str ='testobj'
+    check_access_denied(alt_client.put_object, Bucket=bucket_name, Key=key1_str, Body=key1_str)
+
+    headers = {"x-amz-tagging" : "security=public"}
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    #TODO: why is this a 400 and not passing
+    alt_client.put_object(Bucket=bucket_name, Key=key1_str, Body=key1_str)
+
+@attr(resource='object')
+@attr(method='get')
+@attr(operation='Test ExistingObjectTag conditional on get object acl')
+@attr(assertion='success')
+@attr('tagging')
+@attr('bucket-policy')
+def test_bucket_policy_get_obj_acl_existing_tag():
+    bucket_name = _create_objects(keys=['publictag', 'privatetag', 'invalidtag'])
+    client = get_client()
+
+    tag_conditional = {"StringEquals": {
+        "s3:ExistingObjectTag/security" : "public"
+    }}
+
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:GetObjectAcl",
+                                       resource,
+                                       conditions=tag_conditional)
+
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    tagset = []
+    tagset.append({'Key': 'security', 'Value': 'public'})
+    tagset.append({'Key': 'foo', 'Value': 'bar'})
+
+    input_tagset = {'TagSet': tagset}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='publictag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    tagset2 = []
+    tagset2.append({'Key': 'security', 'Value': 'private'})
+
+    input_tagset = {'TagSet': tagset2}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='privatetag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    tagset3 = []
+    tagset3.append({'Key': 'security1', 'Value': 'public'})
+
+    input_tagset = {'TagSet': tagset3}
+
+    response = client.put_object_tagging(Bucket=bucket_name, Key='invalidtag', Tagging=input_tagset)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    alt_client = get_alt_client()
+    response = alt_client.get_object_acl(Bucket=bucket_name, Key='publictag')
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+    # A get object itself should fail since we allowed only GetObjectTagging
+    e = assert_raises(ClientError, alt_client.get_object, Bucket=bucket_name, Key='publictag')
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+    e = assert_raises(ClientError, alt_client.get_object_tagging, Bucket=bucket_name, Key='privatetag')
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+    e = assert_raises(ClientError, alt_client.get_object_tagging, Bucket=bucket_name, Key='invalidtag')
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
 
