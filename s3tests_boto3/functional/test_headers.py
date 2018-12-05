@@ -203,6 +203,7 @@ def test_object_create_bad_contentlength_empty():
 # Look at what the outgoing requests look like and see what gives??
 def test_object_create_bad_contentlength_negative():
     #TODO: if I put quotes around the -1 it gets me a 403, try the boto2 version
+    #THIS IS THE ONE IM WORKING ON: see what difference is if I provide ContentLength in put_object
     e = _add_header_create_bad_object({'Content-Length':'-1'})
     status, error_code = _get_status_and_error_code(e.response)
     eq(status, 403)
@@ -235,4 +236,27 @@ def test_object_create_bad_contentlength_none():
     #eq(status, 411)
     #eq(error_code, 'MissingContentLength')
 
+@tag('auth_common')
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='create w/non-graphic content length')
+@attr(assertion='fails 400')
+@attr('fails_on_mod_proxy_fcgi')
+@attr('fails_strict_rfc2616')
+#TODO: the boto2 version succeeeds and returns a 400, the boto3 version succeeds and returns a 403. 
+# Look at what the outgoing requests look like and see what gives??
+def test_object_create_bad_contentlength_unreadable():
+    e = _add_header_create_bad_object({'Content-Length':'\x07'})
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
+@tag('auth_common')
+@attr(resource='object')
+@attr(method='put')
+@attr(operation='create w/content length too long')
+@attr(assertion='fails 400')
+@attr('fails_on_rgw')
+def test_object_create_bad_contentlength_mismatch_above():
+    content = 'bar'
+    length = len(content) + 1
 

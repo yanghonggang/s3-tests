@@ -1,4 +1,5 @@
 import boto3
+import botocore.session
 from botocore.exceptions import ClientError
 from botocore.exceptions import ParamValidationError
 from nose.tools import eq_ as eq
@@ -38,6 +39,7 @@ from . import (
     get_prefix,
     get_unauthenticated_client,
     get_bad_auth_client,
+    get_v2_client,
     get_new_bucket,
     get_new_bucket_name,
     get_new_bucket_resource,
@@ -56,6 +58,7 @@ from . import (
     get_alt_user_id,
     get_alt_email,
     get_alt_client,
+    get_tenant_client,
     get_buckets_list,
     get_objects_list,
     nuke_prefixed_buckets,
@@ -6620,7 +6623,6 @@ def _test_atomic_dual_write(file_size):
     fp_a = FakeWriteFile(file_size, 'A')
 
     def rewind_put_fp_a():
-        #TODO: learn why this is necessary
         fp_a.seek(0)
         client.put_object(Bucket=bucket_name, Key=objname, Body=fp_a)
 
@@ -6708,7 +6710,6 @@ def _test_atomic_dual_conditional_write(file_size):
     lf = (lambda **kwargs: kwargs['params']['headers'].update({'If-Match': etag_fp_a}))
     client.meta.events.register('before-call.s3.PutObject', lf)
     def rewind_put_fp_b():
-        #TODO: learn why this is necessary
         fp_b.seek(0)
         client.put_object(Bucket=bucket_name, Key=objname, Body=fp_b)
 
@@ -6997,7 +6998,7 @@ def check_obj_versions(client, bucket_name, key, version_ids, contents):
         check_obj_content(client, bucket_name, key, version['VersionId'], contents[i])
         i += 1
 
-def create_multiple_versions(client, bucket_name, key, num_versions, version_ids = None, contents = None):
+def create_multiple_versions(client, bucket_name, key, num_versions, version_ids = None, contents = None, check_versions = True):
     contents = contents or []
     version_ids = version_ids or []
 
@@ -7009,7 +7010,8 @@ def create_multiple_versions(client, bucket_name, key, num_versions, version_ids
         contents.append(body)
         version_ids.append(version_id)
 
-    check_obj_versions(client, bucket_name, key, version_ids, contents) 
+    if check_versions:
+        check_obj_versions(client, bucket_name, key, version_ids, contents) 
 
     return (version_ids, contents)
 
@@ -7781,6 +7783,382 @@ def test_versioned_concurrent_object_create_and_remove():
 
     response = client.list_object_versions(Bucket=bucket_name)
     eq(('Versions' in response), False)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='set lifecycle config')
+@attr('lifecycle')
+def test_lifecycle_set():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'Days': 1}, 'Prefix': 'test1/', 'Status':'Enabled'},
+           {'ID': 'rule2', 'Expiration': {'Days': 2}, 'Prefix': 'test2/', 'Status':'Disabled'}]
+    lifecycle = {'Rules': rules}
+    response = client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='get lifecycle config')
+@attr('lifecycle')
+def test_lifecycle_get():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'test1/', 'Expiration': {'Days': 31}, 'Prefix': 'test1/', 'Status':'Enabled'},
+           {'ID': 'test2/', 'Expiration': {'Days': 120}, 'Prefix': 'test2/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    response = client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+    eq(response['Rules'], rules)
+
+@attr(resource='bucket')
+@attr(method='get')
+@attr(operation='get lifecycle config no id')
+@attr('lifecycle')
+def test_lifecycle_get_no_id():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'Expiration': {'Days': 31}, 'Prefix': 'test1/', 'Status':'Enabled'},
+           {'Expiration': {'Days': 120}, 'Prefix': 'test2/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    response = client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+    current_lc = response['Rules']
+
+    # validate all the rules are the same except the ID, which is returned as random
+    for i in range(2):
+        eq(current_lc[i]['Prefix'], rules[i]['Prefix'])
+        eq(current_lc[i]['Status'], rules[i]['Status'])
+        eq(current_lc[i]['Expiration']['Days'], rules[i]['Expiration']['Days'])
+
+# The test harness for lifecycle is configured to treat days as 10 second intervals.
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='test lifecycle expiration')
+@attr('lifecycle')
+@attr('lifecycle_expiration')
+@attr('fails_on_aws')
+def test_lifecycle_expiration():
+    bucket_name = _create_objects(keys=['expire1/foo', 'expire1/bar', 'keep2/foo',
+                                        'keep2/bar', 'expire3/foo', 'expire3/bar'])
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'Days': 1}, 'Prefix': 'expire1/', 'Status':'Enabled'},
+           {'ID': 'rule2', 'Expiration': {'Days': 4}, 'Prefix': 'expire3/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    response = client.list_objects(Bucket=bucket_name)
+    init_objects = response['Contents']
+
+    time.sleep(28)
+    response = client.list_objects(Bucket=bucket_name)
+    expire1_objects = response['Contents']
+
+    time.sleep(10)
+    response = client.list_objects(Bucket=bucket_name)
+    keep2_objects = response['Contents']
+
+    time.sleep(20)
+    response = client.list_objects(Bucket=bucket_name)
+    expire3_objects = response['Contents']
+
+    eq(len(init_objects), 6)
+    eq(len(expire1_objects), 4)
+    eq(len(keep2_objects), 4)
+    eq(len(expire3_objects), 2)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='id too long in lifecycle rule')
+@attr('lifecycle')
+@attr(assertion='fails 400')
+def test_lifecycle_id_too_long():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 256*'a', 'Expiration': {'Days': 2}, 'Prefix': 'test1/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+
+    e = assert_raises(ClientError, client.put_bucket_lifecycle_configuration, Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'InvalidArgument')
+    
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='same id')
+@attr('lifecycle')
+@attr(assertion='fails 400')
+def test_lifecycle_same_id():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'Days': 1}, 'Prefix': 'test1/', 'Status':'Enabled'},
+           {'ID': 'rule1', 'Expiration': {'Days': 2}, 'Prefix': 'test2/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+
+    e = assert_raises(ClientError, client.put_bucket_lifecycle_configuration, Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'InvalidArgument')
+    
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='invalid status in lifecycle rule')
+@attr('lifecycle')
+@attr(assertion='fails 400')
+def test_lifecycle_invalid_status():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'Days': 2}, 'Prefix': 'test1/', 'Status':'enabled'}]
+    lifecycle = {'Rules': rules}
+
+    e = assert_raises(ClientError, client.put_bucket_lifecycle_configuration, Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'MalformedXML')
+    
+    rules=[{'ID': 'rule1', 'Expiration': {'Days': 2}, 'Prefix': 'test1/', 'Status':'disabled'}]
+    lifecycle = {'Rules': rules}
+
+    e = assert_raises(ClientError, client.put_bucket_lifecycle, Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'MalformedXML')
+
+    rules=[{'ID': 'rule1', 'Expiration': {'Days': 2}, 'Prefix': 'test1/', 'Status':'invalid'}]
+    lifecycle = {'Rules': rules}
+
+    e = assert_raises(ClientError, client.put_bucket_lifecycle_configuration, Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'MalformedXML')
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='rules conflicted in lifecycle')
+@attr('lifecycle')
+@attr(assertion='fails 400')
+def test_lifecycle_rules_conflicted():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'Days': 2}, 'Prefix': 'test1/', 'Status':'Enabled'},
+           {'ID': 'rule2', 'Expiration': {'Days': 3}, 'Prefix': 'test3/', 'Status':'Enabled'},
+           {'ID': 'rule3', 'Expiration': {'Days': 5}, 'Prefix': 'test1/abc', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+
+    e = assert_raises(ClientError, client.put_bucket_lifecycle_configuration, Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+    eq(error_code, 'InvalidRequest')
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='set lifecycle config with expiration date')
+@attr('lifecycle')
+def test_lifecycle_set_date():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'Date': '2017-09-27'}, 'Prefix': 'test1/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+
+    response = client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='set lifecycle config with not iso8601 date')
+@attr('lifecycle')
+@attr(assertion='fails 400')
+def test_lifecycle_set_invalid_date():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'Date': '20200101'}, 'Prefix': 'test1/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+
+    e = assert_raises(ClientError, client.put_bucket_lifecycle_configuration, Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 400)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='test lifecycle expiration with date')
+@attr('lifecycle')
+@attr('lifecycle_expiration')
+@attr('fails_on_aws')
+def test_lifecycle_expiration_date():
+    bucket_name = _create_objects(keys=['past/foo', 'future/bar'])
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'Date': '2015-01-01'}, 'Prefix': 'past/', 'Status':'Enabled'},
+           {'ID': 'rule2', 'Expiration': {'Date': '2030-01-01'}, 'Prefix': 'future/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    response = client.list_objects(Bucket=bucket_name)
+    init_objects = response['Contents']
+
+    time.sleep(20)
+    response = client.list_objects(Bucket=bucket_name)
+    expire_objects = response['Contents']
+
+    eq(len(init_objects), 2)
+    eq(len(expire_objects), 1)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='set lifecycle config with noncurrent version expiration')
+@attr('lifecycle')
+def test_lifecycle_set_noncurrent():
+    bucket_name = _create_objects(keys=['past/foo', 'future/bar'])
+    client = get_client()
+    rules=[{'ID': 'rule1', 'NoncurrentVersionExpiration': {'NoncurrentDays': 2}, 'Prefix': 'past/', 'Status':'Enabled'},
+           {'ID': 'rule2', 'NoncurrentVersionExpiration': {'NoncurrentDays': 3}, 'Prefix': 'future/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    response = client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='test lifecycle non-current version expiration')
+@attr('lifecycle')
+@attr('lifecycle_expiration')
+@attr('fails_on_aws')
+def test_lifecycle_noncur_expiration():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    create_multiple_versions(client, bucket_name, "test1/a", 3)
+    # not checking the object contents on the second run, because the function doesn't support multiple checks
+    create_multiple_versions(client, bucket_name, "test2/abc", 3, check_versions=False)
+
+    response  = client.list_object_versions(Bucket=bucket_name)
+    init_versions = response['Versions']
+
+    rules=[{'ID': 'rule1', 'NoncurrentVersionExpiration': {'NoncurrentDays': 2}, 'Prefix': 'test1/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    time.sleep(50)
+
+    response  = client.list_object_versions(Bucket=bucket_name)
+    expire_versions = response['Versions']
+    eq(len(init_versions), 6)
+    eq(len(expire_versions), 4)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='set lifecycle config with delete marker expiration')
+@attr('lifecycle')
+def test_lifecycle_set_deletemarker():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'ExpiredObjectDeleteMarker': True}, 'Prefix': 'test1/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    response = client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='set lifecycle config with Filter')
+@attr('lifecycle')
+def test_lifecycle_set_filter():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'ExpiredObjectDeleteMarker': True}, 'Filter': {'Prefix': 'foo'}, 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    response = client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='set lifecycle config with empty Filter')
+@attr('lifecycle')
+def test_lifecycle_set_empty_filter():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules=[{'ID': 'rule1', 'Expiration': {'ExpiredObjectDeleteMarker': True}, 'Filter': {}, 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    response = client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='test lifecycle delete marker expiration')
+@attr('lifecycle')
+@attr('lifecycle_expiration')
+@attr('fails_on_aws')
+def test_lifecycle_deletemarker_expiration():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    create_multiple_versions(client, bucket_name, "test1/a", 1)
+    create_multiple_versions(client, bucket_name, "test2/abc", 1, check_versions=False)
+    client.delete_object(Bucket=bucket_name, Key="test1/a")
+    client.delete_object(Bucket=bucket_name, Key="test2/abc")
+
+    response  = client.list_object_versions(Bucket=bucket_name)
+    init_versions = response['Versions']
+    deleted_versions = response['DeleteMarkers']
+    total_init_versions = init_versions + deleted_versions
+
+    rules=[{'ID': 'rule1', 'NoncurrentVersionExpiration': {'NoncurrentDays': 1}, 'Expiration': {'ExpiredObjectDeleteMarker': True}, 'Prefix': 'test1/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    time.sleep(50)
+
+    response  = client.list_object_versions(Bucket=bucket_name)
+    init_versions = response['Versions']
+    deleted_versions = response['DeleteMarkers']
+    total_expire_versions = init_versions + deleted_versions
+
+    eq(len(total_init_versions), 4)
+    eq(len(total_expire_versions), 2)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='set lifecycle config with multipart expiration')
+@attr('lifecycle')
+def test_lifecycle_set_multipart():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules = [
+        {'ID': 'rule1', 'Prefix': 'test1/', 'Status': 'Enabled',
+         'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 2}},
+        {'ID': 'rule2', 'Prefix': 'test2/', 'Status': 'Disabled',
+         'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 3}}
+    ]
+    lifecycle = {'Rules': rules}
+    response = client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+@attr(resource='bucket')
+@attr(method='put')
+@attr(operation='test lifecycle multipart expiration')
+@attr('lifecycle')
+@attr('lifecycle_expiration')
+@attr('fails_on_aws')
+def test_lifecycle_multipart_expiration():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    key_names = ['test1/a', 'test2/']
+    upload_ids = []
+
+    for key in key_names:
+        response = client.create_multipart_upload(Bucket=bucket_name, Key=key)
+        upload_ids.append(response['UploadId'])
+
+    response = client.list_multipart_uploads(Bucket=bucket_name)
+    init_uploads = response['Uploads']
+
+    rules = [
+        {'ID': 'rule1', 'Prefix': 'test1/', 'Status': 'Enabled',
+         'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 2}},
+    ]
+    lifecycle = {'Rules': rules}
+    response = client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+    time.sleep(50)
+
+    response = client.list_multipart_uploads(Bucket=bucket_name)
+    expired_uploads = response['Uploads']
+    eq(len(init_uploads), 2)
+    eq(len(expired_uploads), 1)
+
 
 def _test_encryption_sse_customer_write(file_size):
     """
@@ -8698,9 +9076,21 @@ def test_bucket_policy_different_tenant():
 
     client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
 
-    #TODO: figure out where 'tenant' user comes from
-    alt_client = get_alt_client()
-    response = alt_client.list_objects(Bucket=bucket_name)
+    # TODO: figure out how to change the bucketname
+    def change_bucket_name(**kwargs):
+        kwargs['params']['url'] = "http://localhost:8000/:{bucket_name}?encoding-type=url".format(bucket_name=bucket_name)
+        kwargs['params']['url_path'] = "/:{bucket_name}".format(bucket_name=bucket_name)
+        kwargs['params']['context']['signing']['bucket'] = ":{bucket_name}".format(bucket_name=bucket_name)
+        print kwargs['request_signer']
+        print kwargs
+
+    #bucket_name = ":" + bucket_name
+    tenant_client = get_tenant_client()
+    tenant_client.meta.events.register('before-call.s3.ListObjects', change_bucket_name)
+    response = tenant_client.list_objects(Bucket=bucket_name)
+    #alt_client = get_alt_client()
+    #response = alt_client.list_objects(Bucket=bucket_name)
+
     eq(len(response['Contents']), 1)
 
 @attr(resource='bucket')
@@ -8736,7 +9126,6 @@ def test_bucket_policy_another_bucket():
 
     client.put_bucket_policy(Bucket=bucket_name2, Policy=response_policy)
 
-    #TODO: figure out where 'tenant' user comes from
     alt_client = get_alt_client()
     response = alt_client.list_objects(Bucket=bucket_name)
     eq(len(response['Contents']), 1)
@@ -8772,6 +9161,17 @@ def test_bucket_policy_set_condition_operator_end_with_IfExists():
     }''' % bucket_name
     client.put_bucket_policy(Bucket=bucket_name, Policy=policy)
 
+    request_headers={'referer': 'http://example.com'}
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(request_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+
+    # TODO: Ask why this is not a 403 and is succeeding. The correct header seems to be there
+    # DEBUGGING: Compare rgw log output from boto2 and boto3, ask Adam if I can't figure it out
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    eq(status, 403)
+
     request_headers={'referer': 'http://www.example.com/'}
 
     lf = (lambda **kwargs: kwargs['params']['headers'].update(request_headers))
@@ -8791,15 +9191,8 @@ def test_bucket_policy_set_condition_operator_end_with_IfExists():
     response = client.get_object(Bucket=bucket_name, Key=key)
     eq(response['ResponseMetadata']['HTTPStatusCode'], 200)
 
-    request_headers={'referer': 'http://example.com'}
-
-    lf = (lambda **kwargs: kwargs['params']['headers'].update(request_headers))
-    client.meta.events.register('before-call.s3.GetObject', lf)
-
-    # TODO: Ask why this is not a 403 and is succeeding
-    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
-    status, error_code = _get_status_and_error_code(e.response)
-    eq(status, 403)
+    response =  client.get_bucket_policy(Bucket=bucket_name)
+    print response
 
 def _create_simple_tagset(count):
     tagset = []
@@ -9031,13 +9424,17 @@ def test_post_object_tags_anonymous_request():
 
     key_name = "foo.txt"
     input_tagset = _create_simple_tagset(2)
+    # xml_input_tagset is the same as input_tagset in xml.
+    # There is not a simple way to change input_tagset to xml like there is in the boto2 tetss
+    # TODO (later): figure out how to not hard code thise
+    xml_input_tagset = "<Tagging><TagSet><Tag><Key>0</Key><Value>0</Value></Tag><Tag><Key>1</Key><Value>1</Value></Tag></TagSet></Tagging>"
+
 
     payload = OrderedDict([
         ("key" , key_name),
         ("acl" , "public-read"),
         ("Content-Type" , "text/plain"),
-        # TODO figure out how to provide the input correctly
-        #("tagging", input_tagset.to_xml()),
+        ("tagging", xml_input_tagset),
         ('file', ('bar')),
     ])
 
@@ -9058,7 +9455,11 @@ def test_post_object_tags_anonymous_request():
 def test_post_object_tags_authenticated_request():
     bucket_name = get_new_bucket()
     client = get_client()
-    input_tagset = _create_simple_tagset(2)
+    # xml_input_tagset is the same as `input_tagset = _create_simple_tagset(2)` in xml
+    # There is not a simple way to change input_tagset to xml like there is in the boto2 tetss
+    # TODO (later): figure out how to not hard code thise
+    xml_input_tagset = "<Tagging><TagSet><Tag><Key>0</Key><Value>0</Value></Tag><Tag><Key>1</Key><Value>1</Value></Tag></TagSet></Tagging>"
+
 
     url = _get_post_url(bucket_name)
     utc = pytz.utc
@@ -9086,8 +9487,7 @@ def test_post_object_tags_authenticated_request():
         ("key" , "foo.txt"),
         ("AWSAccessKeyId" , aws_access_key_id),\
         ("acl" , "private"),("signature" , signature),("policy" , policy),\
-        # TODO figure out how to provide the input correctly
-        #("tagging", input_tagset.to_xml()),
+        ("tagging", xml_input_tagset),
         ("Content-Type" , "text/plain"),
         ('file', ('bar'))])
 
@@ -9110,15 +9510,11 @@ def test_put_obj_with_tags():
     data = 'A'*100
 
     tagset = []
+    tagset.append({'Key': 'bar', 'Value': ''})
     tagset.append({'Key': 'foo', 'Value': 'bar'})
-    #tagset.append({'Key': 'bar', 'Value': ''})
-    tagset = {'Key': 'foo', 'Value': 'bar'}
 
-    #input_tagset = {'TagSet': tagset}
-    # TODO: run this in boto2 and see what input_tagset is when you print it out and what the return values look like
-    input_tagset = '<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet><Tag><Value>0</Value><Key>0</Key></Tag><Tag><Value>1</Value><Key>1</Key></Tag></TagSet></Tagging>'
     put_obj_tag_headers = {
-        'x-amz-tagging' : input_tagset
+        'x-amz-tagging' : 'foo=bar&bar'
     }
 
     lf = (lambda **kwargs: kwargs['params']['headers'].update(put_obj_tag_headers))
@@ -9129,10 +9525,8 @@ def test_put_obj_with_tags():
     body = _get_body(response)
     eq(body, data)
 
-    input_tagset = _create_simple_tagset(2)
     response = client.get_object_tagging(Bucket=bucket_name, Key=key)
-    #eq(response['TagSet'], input_tagset)
-    print response['TagSet']
+    eq(response['TagSet'], tagset)
 
 def _make_arn_resource(path="*"):
     return "arn:aws:s3:::{}".format(path)
@@ -9713,7 +10107,7 @@ def test_bucket_policy_put_obj_grant():
 @attr('bucket-policy')
 def test_bucket_policy_put_obj_enc():
     bucket_name = get_new_bucket()
-    client = get_client()
+    client = get_v2_client()
 
     deny_incorrect_algo = {
         "StringNotEquals": {
@@ -9734,8 +10128,13 @@ def test_bucket_policy_put_obj_enc():
     s2 = Statement("s3:PutObject", resource, effect="Deny", condition=deny_unencrypted_obj)
     policy_document = p.add_statement(s1).add_statement(s2).to_json()
 
+    boto3.set_stream_logger(name='botocore')
+
     client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
     key1_str ='testobj'
+
+    #response = client.get_bucket_policy(Bucket=bucket_name)
+    #print response
 
     check_access_denied(client.put_object, Bucket=bucket_name, Key=key1_str, Body=key1_str)
 
@@ -9748,8 +10147,11 @@ def test_bucket_policy_put_obj_enc():
 
     lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
     client.meta.events.register('before-call.s3.PutObject', lf)
-    #TODO: why is this a 400 and not passing
-    client.put_object(Bucket=bucket_name, Key=key1_str, Body=key1_str)
+    #TODO: why is this a 400 and not passing, it appears boto3 is not parsing the 200 response the rgw sends back properly
+    # DEBUGGING: run the boto2 and compare the requests
+    # DEBUGGING: try to run this with v2 auth (figure out why get_v2_client isn't working) to make the requests similar to what boto2 is doing
+    # DEBUGGING: try to add other options to put_object to see if that makes the response better
+    client.put_object(Bucket=bucket_name, Key=key1_str)
 
 @attr(resource='object')
 @attr(method='put')

@@ -20,7 +20,7 @@ bucket prefix = yournamehere-{random}-
 # main display_name set in vstart.sh
 display_name = M. Tester
 
-# main user_id name set in vstart.sh
+# main user_idname set in vstart.sh
 user_id = testid
 
 # main email set in vstart.sh
@@ -40,7 +40,7 @@ display_name = john.doe
 ## alt email set in vstart.sh
 email = john.doe@example.com
 
-# alt user_id name set in vstart.sh
+# alt user_id set in vstart.sh
 user_id = 56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234
 
 # alt AWS access key set in vstart.sh
@@ -48,3 +48,19 @@ access_key = NOPQRSTUVWXYZABCDEFG
 
 # alt AWS secret key set in vstart.sh
 secret_key = nopqrstuvwxyzabcdefghijklmnabcdefghijklm
+
+[s3 tenant]
+# tenant display_name set in vstart.sh
+display_name = testx$tenanteduser
+
+# tenant user_id set in vstart.sh
+user_id = 9876543210abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+# tenant AWS secret key set in vstart.sh
+access_key = HIJKLMNOPQRSTUVWXYZA
+
+# tenant AWS secret key set in vstart.sh
+secret_key = opqrstuvwxyzabcdefghijklmnopqrstuvwxyzab
+
+# tenant email set in vstart.sh
+email = tenanteduser@example.com
