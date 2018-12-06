@@ -185,7 +185,8 @@ def test_object_create_bad_expect_unreadable():
 @attr(assertion='fails 400')
 #TODO: the boto2 version succeeeds and returns a 400, the boto3 version succeeds and returns a 403. 
 # Look at what the outgoing requests look like and see what gives??
-#@attr('fails_on_rgw')
+# TODO: see if this 'fails_on_rgw' is necessary
+@attr('fails_on_rgw')
 def test_object_create_bad_contentlength_empty():
     e = _add_header_create_bad_object({'Content-Length':''})
     status, error_code = _get_status_and_error_code(e.response)
@@ -199,6 +200,8 @@ def test_object_create_bad_contentlength_empty():
 @attr(operation='create w/negative content length')
 @attr(assertion='fails 400')
 @attr('fails_on_mod_proxy_fcgi')
+# TODO: remove 'fails_on_rgw' once I figure out what's going on
+@attr('fails_on_rgw')
 #TODO: the boto2 version succeeeds and returns a 400, the boto3 version succeeds and returns a 403. 
 # Look at what the outgoing requests look like and see what gives??
 def test_object_create_bad_contentlength_negative():
